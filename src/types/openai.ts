@@ -9,8 +9,22 @@ export interface OpenAIContentBlock {
 }
 
 export interface OpenAIChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string | OpenAIContentBlock[];
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: OpenAIToolCall[];
+}
+
+export interface OpenAIFunctionDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface OpenAIToolDefinition {
+  type: "function";
+  function: OpenAIFunctionDefinition;
 }
 
 export interface OpenAIChatRequest {
@@ -23,6 +37,8 @@ export interface OpenAIChatRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   user?: string; // Used for session mapping
+  tools?: OpenAIToolDefinition[];
+  tool_choice?: "auto" | "none" | { type: "function"; function: { name: string } };
 }
 
 export interface OpenAIToolCall {

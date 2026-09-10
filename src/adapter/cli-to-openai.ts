@@ -63,6 +63,28 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
 }
 
 /**
+ * Create a usage-only chunk for streaming.
+ *
+ * OpenAI returns usage as a separate chunk with empty choices when
+ * stream_options.include_usage is enabled. Some clients rely on this shape
+ * to correctly update token counters.
+ */
+export function createUsageChunk(
+  requestId: string,
+  model: string,
+  usage: OpenAIChatResponse["usage"]
+): OpenAIChatChunk {
+  return {
+    id: `chatcmpl-${requestId}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: normalizeModelName(model),
+    choices: [],
+    usage,
+  };
+}
+
+/**
  * Convert Claude CLI result to OpenAI non-streaming response
  */
 export function cliResultToOpenai(
@@ -111,8 +133,9 @@ export function cliResultToOpenai(
  */
 function normalizeModelName(model: string | undefined): string {
   if (!model) return "claude-sonnet-4";
-  if (model.includes("opus")) return "claude-opus-4";
-  if (model.includes("sonnet")) return "claude-sonnet-4";
-  if (model.includes("haiku")) return "claude-haiku-4";
+  const m = model.match(/claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?/);
+  if (m) {
+    return m[3] ? `claude-${m[1]}-${m[2]}-${m[3]}` : `claude-${m[1]}-${m[2]}`;
+  }
   return model;
 }

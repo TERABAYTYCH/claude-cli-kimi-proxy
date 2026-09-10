@@ -10,6 +10,10 @@ import { EventEmitter } from "events";
 import fs from "fs/promises";
 import { readFileSync } from "fs";
 import path from "path";
+import os from "os";
+import crypto from "crypto";
+
+import { logger } from "../utils/logger.js";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
@@ -34,6 +38,9 @@ export interface SubprocessOptions {
   resume?: boolean;
   cwd?: string;
   timeout?: number;
+  systemPrompt?: string; // ← новое поле, системный промпт от Kimi
+  /** If true, disable all built-in Claude CLI tools and force delegation output. */
+  delegateTools?: boolean;
 }
 
 export interface SubprocessEvents {
@@ -46,50 +53,6 @@ export interface SubprocessEvents {
 }
 
 const DEFAULT_TIMEOUT = 900000; // 15 minutes
-
-/**
- * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
- * OpenClaw's system prompt references tools like `exec`, `read`, `web_search` etc. that
- * don't exist in Claude Code. This mapping tells the model what to use instead.
- */
-const OPENCLAW_TOOL_MAPPING_PROMPT = [
-  "## Tool Name Mapping",
-  "You are running inside Claude Code CLI, not OpenClaw. The system prompt may reference OpenClaw tool names — map them to your actual tools:",
-  "",
-  "### Direct tool replacements",
-  "- `exec` or `process` → use `Bash` (run shell commands)",
-  "- `read` → use `Read` (read file contents)",
-  "- `write` → use `Write` (write files)",
-  "- `edit` → use `Edit` (edit files)",
-  "- `grep` → use `Grep` (search file contents)",
-  "- `find` or `ls` → use `Glob` or `Bash(ls ...)`",
-  "- `web_search` → use `WebSearch`",
-  "- `web_fetch` → use `WebFetch`",
-  "- `image` → use `Read` (Claude Code can read images)",
-  "",
-  "### OpenClaw CLI tools (use via Bash)",
-  "These OpenClaw tools are available through the `openclaw` CLI. Use `Bash` to run them:",
-  '- `memory_search` → `Bash(openclaw memory search "<query>")` — semantic search across memory files',
-  "- `memory_get` → `Read` on the memory file directly, OR `Bash(openclaw memory search \"<query>\")` for discovery",
-  '- `message` → `Bash(openclaw message send --to <target> "<text>")` — send messages to channels (Telegram, Discord, etc.)',
-  "  - Also: `openclaw message read`, `openclaw message broadcast`, `openclaw message react`, `openclaw message poll`",
-  "- `cron` → `Bash(openclaw cron list)`, `Bash(openclaw cron add ...)`, `Bash(openclaw cron status)` — manage scheduled jobs",
-  "  - Also: `openclaw cron rm`, `openclaw cron enable`, `openclaw cron disable`, `openclaw cron runs`, `openclaw cron run`, `openclaw cron edit`",
-  '- `sessions_list` → `Bash(openclaw agent --local --message "list sessions")` or check session files directly',
-  '- `sessions_history` → `Bash(openclaw agent --local --message "show history for session <key>")` or check session files',
-  "- `nodes` → `Bash(openclaw nodes status)`, `Bash(openclaw nodes describe <node>)`, `Bash(openclaw nodes invoke --node <id> --command <cmd>)`",
-  '  - Also: `openclaw nodes run --node <id> "<shell command>"` for running commands on paired nodes',
-  "",
-  "### Not available via CLI",
-  "- `browser` — requires OpenClaw's dedicated browser server (no CLI equivalent)",
-  "- `canvas` — requires paired node with canvas capability; use `openclaw nodes invoke` if a node is available",
-  "",
-  "### Skills",
-  "When a skill says to run a bash/python command, use the `Bash` tool directly.",
-  "Skills are located in the `skills/` directory relative to your working directory.",
-  "To use a skill: `Read` its SKILL.md file first, then follow the instructions using `Bash`.",
-  "Run `openclaw skills list --eligible --json` to see all available skills.",
-].join("\n");
 
 /**
  * Resolve the real Claude CLI binary to spawn.
@@ -191,27 +154,53 @@ function killProcessTree(
   }
 }
 
+/**
+ * Format a spawn command for logging. Not safe for shell execution because
+ * arguments are simply quoted; intended only for diagnostics.
+ */
+function formatCommand(bin: string, args: string[]): string {
+  const quote = (arg: string): string => {
+    if (arg === "") return '""';
+    if (/[\s"'\\]/.test(arg)) {
+      return `"${arg.replace(/"/g, '\\"')}"`;
+    }
+    return arg;
+  };
+  return [bin, ...args.map(quote)].join(" ");
+}
+
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private systemPromptFilePath: string | null = null;
 
   /**
    * Start the Claude CLI subprocess with the given prompt
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = this.buildArgs(options);
+    const args = await this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
-    if (process.env.DEBUG_SUBPROCESS) {
-      console.error(`[Subprocess] args: ${JSON.stringify(args)}`);
-      console.error(`[Subprocess] prompt: ${prompt.slice(0, 200)}`);
-    }
+    const { bin, shell } = resolveClaudeBin();
+    const command = formatCommand(bin, args);
+    logger.info("Spawning Claude CLI subprocess", {
+      bin,
+      shell,
+      command,
+      model: options.model,
+      hasSessionId: !!options.sessionId,
+      resume: !!options.resume,
+      hasSystemPrompt: !!options.systemPrompt,
+    });
+    logger.debug("Subprocess system prompt preview", {
+      systemPromptPreview: options.systemPrompt?.slice(0, 500),
+    });
+    logger.debug("Subprocess prompt preview", { promptPreview: prompt.slice(0, 200) });
 
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
-        const { bin, shell } = resolveClaudeBin();
         this.process = spawn(bin, args, {
           cwd: options.cwd || process.cwd(),
           env: Object.fromEntries(
@@ -226,6 +215,7 @@ export class ClaudeSubprocess extends EventEmitter {
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
           this.clearTimeout();
+          this.cleanupSystemPromptFile();
           if (err.message.includes("ENOENT")) {
             reject(
               new Error(
@@ -241,16 +231,12 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process.stdin?.write(prompt);
         this.process.stdin?.end();
 
-        if (process.env.DEBUG_SUBPROCESS) {
-          console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
-        }
+        logger.info("Subprocess spawned", { pid: this.process.pid });
 
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
           const data = chunk.toString();
-          if (process.env.DEBUG_SUBPROCESS) {
-            console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
-          }
+          logger.debug("Subprocess stdout chunk", { pid: this.process?.pid, bytes: data.length });
           this.buffer += data;
           this.processBuffer();
         });
@@ -261,22 +247,19 @@ export class ClaudeSubprocess extends EventEmitter {
           if (errorText) {
             // Don't emit as error unless it's actually an error
             // Claude CLI may write debug info to stderr
-            if (process.env.DEBUG_SUBPROCESS) {
-              console.error("[Subprocess stderr]:", errorText.slice(0, 200));
-            }
+            logger.warn("Subprocess stderr", { pid: this.process?.pid, text: errorText.slice(0, 500) });
           }
         });
 
         // Handle process close
         this.process.on("close", (code) => {
-          if (process.env.DEBUG_SUBPROCESS) {
-            console.error(`[Subprocess] Process closed with code: ${code}`);
-          }
+          logger.info("Subprocess closed", { pid: this.process?.pid, code });
           this.clearTimeout();
           // Process any remaining buffer
           if (this.buffer.trim()) {
             this.processBuffer();
           }
+          this.cleanupSystemPromptFile();
           this.emit("close", code);
         });
 
@@ -290,22 +273,37 @@ export class ClaudeSubprocess extends EventEmitter {
   }
 
   /**
-   * Build CLI arguments array
+   * Build CLI arguments array. Async because we may write the system prompt to
+   * a temporary file for --system-prompt-file.
    */
-  private buildArgs(options: SubprocessOptions): string[] {
+  private async buildArgs(options: SubprocessOptions): Promise<string[]> {
     const args = [
       "--print", // Non-interactive mode
-      "--dangerously-skip-permissions", // Skip permission prompts
+      // "--dangerously-skip-permissions", // Skip permission prompts
       "--output-format",
       "stream-json", // JSON streaming output
       "--verbose", // Required for stream-json
       "--include-partial-messages", // Enable streaming chunks
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
-      "--append-system-prompt",
-      OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
+
+    if (options.systemPrompt) {
+      // Fully replace Claude Code's built-in system prompt with the caller's
+      // own identity (e.g. Kimi CLI). Using a file avoids E2BIG on large prompts.
+      const tmpPath = path.join(os.tmpdir(), `claude-sysprompt-${crypto.randomUUID()}.txt`);
+      await fs.writeFile(tmpPath, options.systemPrompt, "utf8");
+      this.systemPromptFilePath = tmpPath;
+      args.push("--system-prompt-file", tmpPath);
+    }
+
+    if (options.delegateTools) {
+      // Prevent the CLI from executing tools internally. An empty list disables
+      // all built-in tools, forcing the model to emit structured <invoke> blocks
+      // which the proxy converts to OpenAI tool_calls for the upstream Kimi chat.
+      args.push("--tools", "");
+    }
 
     if (options.sessionId && options.resume) {
       // Continue a previously persisted session — avoids replaying full history
@@ -321,6 +319,26 @@ export class ClaudeSubprocess extends EventEmitter {
     }
 
     return args;
+  }
+
+  /**
+   * Remove the temporary system prompt file, if one was created.
+   * Set PRESERVE_SYSTEM_PROMPT_FILE=true to keep it for debugging.
+   */
+  private async cleanupSystemPromptFile(): Promise<void> {
+    if (this.systemPromptFilePath) {
+      if (process.env.PRESERVE_SYSTEM_PROMPT_FILE === "true") {
+        logger.info("Preserved system prompt file", { path: this.systemPromptFilePath });
+        this.systemPromptFilePath = null;
+        return;
+      }
+      try {
+        await fs.unlink(this.systemPromptFilePath);
+      } catch {
+        // File may already be gone; ignore.
+      }
+      this.systemPromptFilePath = null;
+    }
   }
 
   /**
@@ -385,6 +403,7 @@ export class ClaudeSubprocess extends EventEmitter {
    */
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
+      logger.info("Killing subprocess", { pid: this.process.pid, signal });
       this.clearTimeout();
       this.isKilled = killProcessTree(this.process, signal);
     }
@@ -420,6 +439,7 @@ export class ClaudeSubprocess extends EventEmitter {
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
   return new Promise((resolve) => {
     const { bin, shell } = resolveClaudeBin();
+    logger.info("Verifying Claude CLI", { bin });
     const proc = spawn(bin, ["--version"], { stdio: "pipe", shell });
     let output = "";
 
@@ -427,7 +447,8 @@ export async function verifyClaude(): Promise<{ ok: boolean; error?: string; ver
       output += chunk.toString();
     });
 
-    proc.on("error", () => {
+    proc.on("error", (err) => {
+      logger.error("Claude CLI verification failed", { bin, error: err.message });
       resolve({
         ok: false,
         error:
@@ -437,8 +458,10 @@ export async function verifyClaude(): Promise<{ ok: boolean; error?: string; ver
 
     proc.on("close", (code) => {
       if (code === 0) {
+        logger.info("Claude CLI verified", { bin, version: output.trim() });
         resolve({ ok: true, version: output.trim() });
       } else {
+        logger.error("Claude CLI verification failed", { bin, code });
         resolve({
           ok: false,
           error: "Claude CLI returned non-zero exit code",
@@ -460,5 +483,6 @@ export async function verifyAuth(): Promise<{ ok: boolean; error?: string }> {
   // credentials are stored in the OS keychain and will be used automatically.
   // We can't easily check the keychain, so we'll just return true if the CLI exists.
   // Authentication errors will surface when making actual API calls.
+  logger.info("Verifying Claude authentication");
   return { ok: true };
 }
