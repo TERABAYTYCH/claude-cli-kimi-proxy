@@ -22,8 +22,14 @@ const sessions = new Map<string, SessionEntry>();
  * at the same time — they would race on the CLI's .jsonl transcript and
  * corrupt the shared context. resolveCliInput() acquires the key before
  * resuming and routes.ts releases it when the request finishes.
+ *
+ * Values are acquisition timestamps: a lock older than LOCK_TTL_MS is
+ * considered leaked (e.g. a code path missed releaseLock) and is stolen,
+ * so one missed release can never disable resume for a conversation
+ * forever.
  */
-const inflight = new Set<string>();
+const inflight = new Map<string, number>();
+const LOCK_TTL_MS = 20 * 60 * 1000; // steal locks held longer than 20 minutes
 
 /**
  * Try to mark a session key as busy. Returns false if another request
@@ -31,8 +37,11 @@ const inflight = new Set<string>();
  * request with a fresh session instead of resuming.
  */
 export function acquireSession(key: string): boolean {
-  if (inflight.has(key)) return false;
-  inflight.add(key);
+  const acquiredAt = inflight.get(key);
+  if (acquiredAt !== undefined && Date.now() - acquiredAt < LOCK_TTL_MS) {
+    return false;
+  }
+  inflight.set(key, Date.now());
   return true;
 }
 
@@ -45,6 +54,13 @@ function pruneExpired(): void {
   for (const [key, entry] of sessions) {
     if (now - entry.lastUsed > SESSION_TTL_MS) {
       sessions.delete(key);
+    }
+  }
+  // Usage totals belong to live conversations only — drop entries whose
+  // session is gone and which no request is currently driving.
+  for (const key of usageTotals.keys()) {
+    if (!sessions.has(key) && !inflight.has(key)) {
+      usageTotals.delete(key);
     }
   }
 }
@@ -95,4 +111,7 @@ export function addUsage(
 
 export function clearSession(key: string): void {
   sessions.delete(key);
+  // Usage totals are per CLI session — reset them with the session, otherwise
+  // the cumulative counters in the log mix several sessions of one chat.
+  usageTotals.delete(key);
 }

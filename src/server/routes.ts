@@ -49,16 +49,30 @@ function rateLimitMessage(result: ClaudeCliResult): string {
 }
 
 /**
- * Persist the CLI session for future --resume turns and drop the per-key
- * inflight lock. Called once per request when the response is complete.
+ * Persist the CLI session for future --resume turns. Does NOT release the
+ * per-key inflight lock: the lock is only dropped once the subprocess has
+ * exited and flushed its transcript (subprocess "close"), otherwise a fast
+ * follow-up --resume could race the transcript write.
  */
-function persistSessionAndRelease(
+function persistSession(
   sessionCtx: SessionContext,
   cliInput: ReturnType<typeof openaiToCli>
 ): void {
   if (sessionCtx.persistSession && sessionCtx.sessionKey && cliInput.sessionId) {
     setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
   }
+}
+
+/**
+ * Persist and release in one step. Only safe at subprocess "close", i.e.
+ * after the transcript has been flushed to disk. Used by the non-streaming
+ * path, where close is the terminal event.
+ */
+function persistSessionAndRelease(
+  sessionCtx: SessionContext,
+  cliInput: ReturnType<typeof openaiToCli>
+): void {
+  persistSession(sessionCtx, cliInput);
   releaseLock(sessionCtx);
 }
 
@@ -80,6 +94,8 @@ function resolveCliInput(body: OpenAIChatRequest): {
   sessionKey: string | undefined;
   resume: boolean;
   persistSession: boolean;
+  /** True if this request holds the per-key inflight lock (see session-store). */
+  lockHeld: boolean;
 } {
   // Kimi may identify a conversation via `user` or `prompt_cache_key`.
   // We use that as our in-memory lookup key, but Claude CLI requires a
@@ -106,7 +122,7 @@ function resolveCliInput(body: OpenAIChatRequest): {
     if (deltaValid && acquireSession(sessionKey as string)) {
       const cliInput = openaiToCliDelta(body, existing.messageCount);
       cliInput.sessionId = existing.claudeSessionId;
-      return { cliInput, sessionKey, resume: true, persistSession: true };
+      return { cliInput, sessionKey, resume: true, persistSession: true, lockHeld: true };
     }
 
     if (deltaValid) {
@@ -118,7 +134,7 @@ function resolveCliInput(body: OpenAIChatRequest): {
       });
       const cliInput = openaiToCli(body);
       cliInput.sessionId = uuidv4();
-      return { cliInput, sessionKey: undefined, resume: false, persistSession: false };
+      return { cliInput, sessionKey: undefined, resume: false, persistSession: false, lockHeld: false };
     }
 
     logger.warn("[Session] Delta validation failed, restarting session from full history", {
@@ -130,14 +146,23 @@ function resolveCliInput(body: OpenAIChatRequest): {
     clearSession(sessionKey as string);
     const cliInput = openaiToCli(body);
     cliInput.sessionId = uuidv4();
-    return { cliInput, sessionKey, resume: false, persistSession: true };
+    // Take the key for the restarted session so a parallel request cannot
+    // --resume it while it is being rebuilt. If the key is busy, run unlocked
+    // and without persisting — whoever holds the lock owns the stored entry.
+    if (acquireSession(sessionKey as string)) {
+      return { cliInput, sessionKey, resume: false, persistSession: true, lockHeld: true };
+    }
+    logger.warn("[Session] Key busy during delta-invalid restart, not persisting", {
+      sessionKey,
+    });
+    return { cliInput, sessionKey: undefined, resume: false, persistSession: false, lockHeld: false };
   }
 
   const cliInput = openaiToCli(body);
   if (sessionKey) {
     cliInput.sessionId = uuidv4(); // pin a known UUID so we can --resume it later
   }
-  return { cliInput, sessionKey, resume: false, persistSession: true };
+  return { cliInput, sessionKey, resume: false, persistSession: true, lockHeld: false };
 }
 
 /**
@@ -188,14 +213,14 @@ export async function handleChatCompletions(
     }
 
     // Convert to CLI input format, resuming a persisted session when we have one
-    const { cliInput, sessionKey, resume, persistSession } = resolveCliInput(body);
+    const { cliInput, sessionKey, resume, persistSession, lockHeld } = resolveCliInput(body);
     const subprocess = new ClaudeSubprocess();
     const sessionCtx: SessionContext = {
       sessionKey,
       resume,
       messageCount: body.messages.length,
       persistSession,
-      lockHeld: resume && !!sessionKey,
+      lockHeld,
     };
 
     logger.info("[ChatCompletions] Request prepared", {
@@ -357,9 +382,11 @@ async function handleStreamingResponse(
 
       delegateEmitted = true;
       isComplete = true;
-      // Persist the session before killing the subprocess so the next turn can
-      // --resume and continue the conversation instead of cold-starting.
-      persistSessionAndRelease(sessionCtx, cliInput);
+      // Persist the session so the next turn can --resume, but keep the
+      // inflight lock until the subprocess exits and flushes its transcript
+      // (subprocess "close") — releasing here would let a fast follow-up
+      // --resume race the transcript write.
+      persistSession(sessionCtx, cliInput);
       finish();
       return true;
     }
@@ -388,9 +415,19 @@ async function handleStreamingResponse(
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
       if (!isComplete) {
-        // Client disconnected before response completed - kill subprocess
+        // Client disconnected mid-response — the CLI transcript is truncated,
+        // so resuming it later would replay a broken conversation. Drop the
+        // session (self-heals via full-history restart), kill the subprocess
+        // and release the lock: with the session cleared, nobody can --resume
+        // the half-written transcript, so early release is safe here.
+        if (sessionCtx.sessionKey) {
+          clearSession(sessionCtx.sessionKey);
+        }
         subprocess.kill();
+        releaseLock(sessionCtx);
       }
+      // isComplete: the lock is dropped on subprocess "close" after the
+      // transcript flush — releasing it here would reopen the B2 race.
       resolve();
     });
 
@@ -476,7 +513,7 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
-      persistSessionAndRelease(sessionCtx, cliInput);
+      persistSession(sessionCtx, cliInput);
       const totals = addUsage(sessionCtx.sessionKey, {
         cacheRead: result.usage?.cache_read_input_tokens,
         cacheCreate: result.usage?.cache_creation_input_tokens,
@@ -590,13 +627,13 @@ async function handleStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
-      // Subprocess exited - ensure response is closed
+      // Terminal event: the transcript is flushed, so the per-key lock can
+      // always be dropped here — for both normal exits and abnormal ones.
       if (code !== 0 && !isComplete) {
         logger.warn("[Streaming] Subprocess closed abnormally", { requestId, code });
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
         }
-        releaseLock(sessionCtx);
         if (!res.writableEnded) {
           // Abnormal exit without result - send error
           res.write(`data: ${JSON.stringify({
@@ -605,6 +642,7 @@ async function handleStreamingResponse(
           res.end();
         }
       }
+      releaseLock(sessionCtx);
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
