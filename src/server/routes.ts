@@ -201,7 +201,15 @@ async function handleStreamingResponse(
     function finish() {
       if (finished) return;
       finished = true;
-      subprocess.kill();
+      // The CLI exits by itself in --print mode once the result is printed.
+      // Give it a short grace period to shut down cleanly (flushing its
+      // session transcript) and only kill it if it hangs.
+      const grace = setTimeout(() => {
+        logger.debug("Grace period expired, killing subprocess", { requestId });
+        subprocess.kill();
+      }, 3000);
+      grace.unref();
+      subprocess.once("close", () => clearTimeout(grace));
       resolve();
     }
 
@@ -382,6 +390,13 @@ async function handleStreamingResponse(
       if (sessionCtx.sessionKey && cliInput.sessionId) {
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
+      logger.info("[Streaming] CLI result usage", {
+        requestId,
+        input: result.usage?.input_tokens,
+        output: result.usage?.output_tokens,
+        cacheRead: result.usage?.cache_read_input_tokens,
+        cacheCreate: result.usage?.cache_creation_input_tokens,
+      });
 
       if (res.writableEnded) {
         finish();

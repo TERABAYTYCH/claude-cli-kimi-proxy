@@ -106,8 +106,25 @@ export function messagesToPrompt(
         if (msg.tool_calls && msg.tool_calls.length > 0) {
           const invokes = msg.tool_calls
             .map((tc) => {
-              const args = tc.function.arguments;
-              return `<invoke name="${tc.function.name}"><parameter name="arguments">${args}</parameter></invoke>`;
+              // Expand the JSON arguments into individual <parameter> elements
+              // matching the delegation instruction format. If we instead show
+              // a single <parameter name="arguments"> blob, the model imitates
+              // it and Kimi rejects the call ("must NOT have additional
+              // property 'arguments'").
+              let paramsXml: string;
+              try {
+                const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+                paramsXml = Object.entries(args)
+                  .map(([key, value]) => {
+                    const rendered =
+                      typeof value === "string" ? value : JSON.stringify(value);
+                    return `<parameter name="${key}">${rendered}</parameter>`;
+                  })
+                  .join("");
+              } catch {
+                paramsXml = `<parameter name="arguments">${tc.function.arguments}</parameter>`;
+              }
+              return `<invoke name="${tc.function.name}">${paramsXml}</invoke>`;
             })
             .join("\n");
           parts.push(`<previous_response>\n${invokes}\n</previous_response>\n`);
@@ -160,6 +177,8 @@ CRITICAL RULES:
 - Do NOT explain or comment
 - Do NOT use more than one tool per response
 - Wait for the actual tool result from the proxy
+- NEVER repeat an invoke whose <tool_result> already appears in the conversation history. Before every call, scan the history: each <previous_response> invoke must be followed by a new, DIFFERENT action — never the same tool with the same arguments again, even if a system-reminder suggests re-checking.
+- If the user's request is a numbered/multi-step list, track progress by matching history invokes to steps: call the tool for the FIRST step that does not yet have a result. Do not go back to earlier steps.
 
 Format:
 <invoke name="<ToolName>">

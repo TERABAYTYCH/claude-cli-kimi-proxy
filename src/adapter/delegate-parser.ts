@@ -165,7 +165,16 @@ function coerceParamsWithSchema(
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(params)) {
     const propSchema = properties[key];
-    result[key] = coerceParamValue(value, propSchema?.type);
+    const coerced = coerceParamValue(value, propSchema?.type);
+    // An empty string for an object/array param means "omitted" (the model
+    // emitted an empty <parameter> tag) — drop it instead of sending "".
+    if (
+      coerced === "" &&
+      (propSchema?.type === "object" || propSchema?.type === "array")
+    ) {
+      continue;
+    }
+    result[key] = coerced;
   }
   return result;
 }
@@ -185,6 +194,26 @@ function parseInvokeBlock(block: string): DelegationRequest | null {
   }
 
   PARAMETER_RE.lastIndex = 0;
+
+  // Unwrap OpenAI-style {"arguments": {...}} nesting: the model sometimes
+  // packs all params into a single "arguments" parameter (imitating history
+  // serialized that way). Kimi rejects the extra property, so flatten it.
+  if ("arguments" in params) {
+    const wrapped = params.arguments;
+    let inner: unknown = wrapped;
+    if (typeof wrapped === "string") {
+      try {
+        inner = JSON.parse(wrapped);
+      } catch {
+        inner = undefined;
+      }
+    }
+    if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+      delete params.arguments;
+      Object.assign(params, inner);
+    }
+  }
+
   return { tool, params };
 }
 
