@@ -158,11 +158,24 @@ export function messagesToPrompt(
 function buildDelegationInstruction(
   tools: OpenAIToolDefinition[]
 ): string {
-  const toolDescriptions = tools
+  // Intentionally compact: full JSON schemas for every tool cost ~40k tokens
+  // of cache prefix on every request. The upstream client (Kimi) validates
+  // arguments against its own schema, so we list names + one-line description
+  // + parameter names with JSON-schema types (no enums/nesting/required).
+  const toolDescriptions = [...tools]
+    .sort((a, b) => a.function.name.localeCompare(b.function.name))
     .map((t) => {
       const fn = t.function;
-      const params = JSON.stringify(fn.parameters || {});
-      return `- ${fn.name}: ${fn.description}\n  Parameters: ${params}`;
+      const desc = (fn.description || "").split("\n")[0].trim().slice(0, 120);
+      const properties = (fn.parameters as
+        | { properties?: Record<string, { type?: string }> }
+        | undefined)?.properties;
+      const paramNames = properties
+        ? Object.entries(properties)
+            .map(([name, schema]) => `${name}:${schema?.type || "string"}`)
+            .join(", ")
+        : "";
+      return `- ${fn.name}: ${desc}${paramNames ? ` [params: ${paramNames}]` : ""}`;
     })
     .join("\n");
 
