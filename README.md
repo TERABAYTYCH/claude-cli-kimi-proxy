@@ -1,3 +1,5 @@
+> **Fork by [TERABAYTYCH](https://github.com/TERABAYTYCH)** — reworked to power **Kimi Code CLI, specifically the Kimi web client**, behind an OpenAI-compatible endpoint. On top of the original proxy this fork adds: delegation of all tool calls to the Kimi client via structured `<invoke>` blocks (Claude plans, Kimi executes), thinking passthrough as `reasoning_content`, Claude rate-limit errors surfaced as visible chat messages instead of blind retries, and hardened delegation parsing (no more repeated tool-call loops).
+
 # Claude Max API Proxy
 
 > Actively maintained fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with OpenClaw integration, improved streaming, and expanded model support.
