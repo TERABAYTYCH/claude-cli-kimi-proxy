@@ -332,6 +332,29 @@ async function handleStreamingResponse(
       }
     });
 
+    // Handle thinking deltas — forward them as reasoning_content so clients
+    // like Kimi can display the model's reasoning process separately.
+    subprocess.on("thinking_delta", (event: ClaudeCliStreamEvent) => {
+      const delta = event.event.delta;
+      const thinking = (delta?.type === "thinking_delta" && delta.thinking) || "";
+      if (!thinking || res.writableEnded) return;
+
+      const chunk = {
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: lastModel,
+        choices: [{
+          index: 0,
+          delta: {
+            reasoning_content: thinking,
+          },
+          finish_reason: null,
+        }],
+      };
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    });
+
     // Handle final assistant message (for model name)
     subprocess.on("assistant", (message: ClaudeCliAssistant) => {
       lastModel = message.message.model;

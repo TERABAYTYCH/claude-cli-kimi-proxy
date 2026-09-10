@@ -28,6 +28,7 @@ import {
   isToolUseBlockStart,
   isInputJsonDelta,
   isContentBlockStop,
+  isThinkingDelta,
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 
@@ -371,6 +372,10 @@ export class ClaudeSubprocess extends EventEmitter {
 
         if (isContentBlockStop(message)) {
           this.emit("content_block_stop", message as ClaudeCliStreamEvent);
+        }
+
+        if (isThinkingDelta(message)) {
+          this.emit("thinking_delta", message as ClaudeCliStreamEvent);
         }
 
         if (isContentDelta(message)) {

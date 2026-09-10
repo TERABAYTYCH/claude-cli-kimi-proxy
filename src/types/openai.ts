@@ -86,6 +86,7 @@ export interface OpenAIChatResponse {
 export interface OpenAIChatChunkDelta {
   role?: "assistant";
   content?: string;
+  reasoning_content?: string;
   tool_calls?: OpenAIToolCallChunk[];
 }
 
