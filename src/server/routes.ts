@@ -12,6 +12,7 @@ import {
   cliResultToOpenai,
   createDoneChunk,
   isRateLimitError,
+  rateLimitRetryAfter,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
 import {
@@ -26,6 +27,21 @@ interface SessionContext {
   sessionKey: string | undefined;
   resume: boolean;
   messageCount: number;
+}
+
+/**
+ * How to surface Claude rate limit errors to the OpenAI client.
+ * - "content" (default): return a normal 200 completion whose text is the
+ *   rate limit message. Kimi's web client retries on HTTP 429 regardless of
+ *   Retry-After, so this is the only way the user actually SEES the error
+ *   in the chat instead of a "Model request failed" retry loop.
+ * - "http": return HTTP 429 (non-streaming) / SSE error event (streaming)
+ *   with a Retry-After header, per OpenAI conventions.
+ */
+const RATE_LIMIT_MODE = process.env.PROXY_RATE_LIMIT_MODE || "content";
+
+function rateLimitMessage(result: ClaudeCliResult): string {
+  return `⚠️ Claude rate limit: ${result.result || "Rate limit exceeded"}`;
 }
 
 /**
@@ -381,12 +397,13 @@ async function handleStreamingResponse(
         }
       }
 
-      // If the CLI returned a rate limit error, send it as an SSE error so
-      // the client knows not to retry.
-      if (isRateLimitError(result)) {
+      if (RATE_LIMIT_MODE === "http" && isRateLimitError(result)) {
+        const retryAfter = rateLimitRetryAfter(result);
         logger.warn("[Streaming] Rate limit error", {
           requestId,
+          mode: RATE_LIMIT_MODE,
           result: result.result,
+          retryAfter,
         });
         res.write(`data: ${JSON.stringify({
           error: {
@@ -399,6 +416,30 @@ async function handleStreamingResponse(
         res.end();
         finish();
         return;
+      }
+
+      // Content mode (default): present the limit message as a normal
+      // completion so clients that retry on any error (e.g. Kimi web)
+      // display it instead of looping on "Model request failed".
+      if (RATE_LIMIT_MODE === "content" && isRateLimitError(result)) {
+        logger.warn("[Streaming] Rate limit error (as content)", {
+          requestId,
+          mode: RATE_LIMIT_MODE,
+          result: result.result,
+          retryAfter: rateLimitRetryAfter(result),
+        });
+        res.write(`data: ${JSON.stringify({
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{
+            index: 0,
+            delta: { content: rateLimitMessage(result) },
+            finish_reason: null,
+          }],
+        })}\n\n`);
+        // Fall through to the standard done chunk below (finish_reason: stop).
       }
 
       // Send final done chunk with finish_reason and usage data
@@ -556,11 +597,17 @@ async function handleNonStreamingResponse(
           });
           res.json(response);
         } else {
-          if (isRateLimitError(finalResult)) {
+          if (RATE_LIMIT_MODE === "http" && isRateLimitError(finalResult)) {
+            const retryAfter = rateLimitRetryAfter(finalResult);
             logger.warn("[NonStreaming] Rate limit error", {
               requestId,
+              mode: RATE_LIMIT_MODE,
               result: finalResult.result,
+              retryAfter,
             });
+            if (retryAfter !== undefined) {
+              res.set("Retry-After", String(retryAfter));
+            }
             res.status(429).json({
               error: {
                 message: finalResult.result || "Rate limit exceeded",
@@ -570,6 +617,20 @@ async function handleNonStreamingResponse(
             });
             resolve();
             return;
+          }
+
+          if (RATE_LIMIT_MODE === "content" && isRateLimitError(finalResult)) {
+            logger.warn("[NonStreaming] Rate limit error (as content)", {
+              requestId,
+              mode: RATE_LIMIT_MODE,
+              result: finalResult.result,
+              retryAfter: rateLimitRetryAfter(finalResult),
+            });
+            finalResult = {
+              ...finalResult,
+              is_error: false,
+              result: rateLimitMessage(finalResult),
+            };
           }
 
           logger.info("[NonStreaming] Returning text response", {

@@ -100,6 +100,62 @@ export function isRateLimitError(result: ClaudeCliResult): boolean {
 }
 
 /**
+ * Parse the reset time from a rate limit message like
+ * "You've hit your session limit · resets 12:20am (Europe/Moscow)"
+ * and return seconds until that moment. Returns undefined if unparseable.
+ */
+export function rateLimitRetryAfter(result: ClaudeCliResult): number | undefined {
+  const text = result.result;
+  if (!text) return undefined;
+  const match = text.match(/resets?\s+(\d{1,2}):(\d{2})\s*(am|pm)\s*\(([^)]+)\)/i);
+  if (!match) return undefined;
+
+  const [, hourStr, minuteStr, ampm, timeZone] = match;
+  let hour = parseInt(hourStr, 10) % 12;
+  if (ampm.toLowerCase() === "pm") hour += 12;
+  const minute = parseInt(minuteStr, 10);
+
+  try {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(now);
+    const get = (type: string) =>
+      parseInt(parts.find((p) => p.type === type)?.value ?? "0", 10);
+
+    // Current wall-clock time in the target timezone, as a fake UTC timestamp
+    const nowInTz = Date.UTC(
+      get("year"),
+      get("month") - 1,
+      get("day"),
+      get("hour") % 24,
+      get("minute"),
+      get("second")
+    );
+    let targetInTz = Date.UTC(
+      get("year"),
+      get("month") - 1,
+      get("day"),
+      hour,
+      minute,
+      0
+    );
+    if (targetInTz <= nowInTz) targetInTz += 24 * 60 * 60 * 1000;
+
+    return Math.max(1, Math.round((targetInTz - nowInTz) / 1000));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Convert Claude CLI result to OpenAI non-streaming response
  */
 export function cliResultToOpenai(
