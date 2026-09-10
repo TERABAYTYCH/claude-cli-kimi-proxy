@@ -304,13 +304,31 @@ export function openaiToCliDelta(
   const fallbackMessages = request.messages.filter((m) => m.role !== "assistant");
   const messagesToSend = newMessages.length ? newMessages : fallbackMessages;
 
-  // System prompt must be rebuilt from the full message history on every turn,
-  // especially in delegate mode: after --resume the CLI does not re-apply the
-  // previous --system-prompt-file, so Claude would forget the delegation rules.
+  // System prompt must be rebuilt from the full message history on every turn.
   const { systemPrompt } = extractSystemPrompt(request.messages);
+  const hasTools = !!request.tools?.length;
+  const prompt = messagesToPrompt(messagesToSend);
+
+  if (hasTools) {
+    // Delegate mode on a resumed turn: do NOT pass --system-prompt-file.
+    // Claude CLI 2.1.x attaches no prompt-cache breakpoints to a replaced
+    // system prompt, so resume + spf bills every turn as full input x 1.0
+    // (verified: cache_read=0 AND cache_creation=0 on repeated identical
+    // requests). Instead, let the CLI use its built-in system prompt — which
+    // is byte-stable across turns and lands in the Anthropic cache — and
+    // re-send the delegation rules as a stable reminder prefix before the
+    // delta. The prefix is identical on every turn, so it is cache-read on
+    // all turns after the first.
+    const reminder = buildSystemPrompt(systemPrompt, request.tools);
+    return {
+      prompt: reminder ? `${reminder}\n\n${prompt}` : prompt,
+      model: extractModel(request.model),
+      systemPrompt: undefined,
+    };
+  }
 
   return {
-    prompt: messagesToPrompt(messagesToSend),
+    prompt,
     model: extractModel(request.model),
     // The caller (routes.ts) assigns a real UUID sessionId; do not use
     // request.user/prompt_cache_key here — Claude CLI requires a UUID.
