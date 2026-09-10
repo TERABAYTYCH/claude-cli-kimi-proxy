@@ -16,6 +16,30 @@ const PRUNE_INTERVAL_MS = 30 * 60 * 1000; // sweep every 30 minutes
 
 const sessions = new Map<string, SessionEntry>();
 
+/**
+ * Keys currently being driven by an in-flight request. Two concurrent
+ * requests with the same sessionKey must never run `claude --resume <id>`
+ * at the same time — they would race on the CLI's .jsonl transcript and
+ * corrupt the shared context. resolveCliInput() acquires the key before
+ * resuming and routes.ts releases it when the request finishes.
+ */
+const inflight = new Set<string>();
+
+/**
+ * Try to mark a session key as busy. Returns false if another request
+ * already holds it — the caller must then fall back to a full-history
+ * request with a fresh session instead of resuming.
+ */
+export function acquireSession(key: string): boolean {
+  if (inflight.has(key)) return false;
+  inflight.add(key);
+  return true;
+}
+
+export function releaseSession(key: string): void {
+  inflight.delete(key);
+}
+
 function pruneExpired(): void {
   const now = Date.now();
   for (const [key, entry] of sessions) {
@@ -47,6 +71,26 @@ export function setSession(
   messageCount: number
 ): void {
   sessions.set(key, { claudeSessionId, messageCount, lastUsed: Date.now() });
+}
+
+/**
+ * Cumulative token usage per conversation key, fed from CLI result events.
+ * Lets the operator spot regressions (usage exploding again) from the log.
+ */
+const usageTotals = new Map<string, { cacheRead: number; cacheCreate: number; output: number; steps: number }>();
+
+export function addUsage(
+  key: string | undefined,
+  usage: { cacheRead?: number; cacheCreate?: number; output?: number }
+): { cacheRead: number; cacheCreate: number; output: number; steps: number } | undefined {
+  if (!key) return undefined;
+  const cur = usageTotals.get(key) || { cacheRead: 0, cacheCreate: 0, output: 0, steps: 0 };
+  cur.cacheRead += usage.cacheRead || 0;
+  cur.cacheCreate += usage.cacheCreate || 0;
+  cur.output += usage.output || 0;
+  cur.steps += 1;
+  usageTotals.set(key, cur);
+  return cur;
 }
 
 export function clearSession(key: string): void {

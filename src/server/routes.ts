@@ -14,7 +14,7 @@ import {
   isRateLimitError,
   rateLimitRetryAfter,
 } from "../adapter/cli-to-openai.js";
-import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
+import { getSession, setSession, clearSession, acquireSession, releaseSession, addUsage } from "../subprocess/session-store.js";
 import {
   parseDelegations,
   delegationsToToolCalls,
@@ -27,6 +27,10 @@ interface SessionContext {
   sessionKey: string | undefined;
   resume: boolean;
   messageCount: number;
+  /** False for fallback requests that must not overwrite the stored session */
+  persistSession: boolean;
+  /** True while this request holds the per-key inflight lock */
+  lockHeld: boolean;
 }
 
 /**
@@ -45,6 +49,28 @@ function rateLimitMessage(result: ClaudeCliResult): string {
 }
 
 /**
+ * Persist the CLI session for future --resume turns and drop the per-key
+ * inflight lock. Called once per request when the response is complete.
+ */
+function persistSessionAndRelease(
+  sessionCtx: SessionContext,
+  cliInput: ReturnType<typeof openaiToCli>
+): void {
+  if (sessionCtx.persistSession && sessionCtx.sessionKey && cliInput.sessionId) {
+    setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
+  }
+  releaseLock(sessionCtx);
+}
+
+/** Drop the inflight lock without persisting (error / abnormal-close paths). */
+function releaseLock(sessionCtx: SessionContext): void {
+  if (sessionCtx.lockHeld && sessionCtx.sessionKey) {
+    releaseSession(sessionCtx.sessionKey);
+    sessionCtx.lockHeld = false;
+  }
+}
+
+/**
  * Resolve CLI input for a request, resuming a persisted Claude CLI session
  * when we have one for this `request.user` key instead of replaying the
  * full message history on every turn.
@@ -53,6 +79,7 @@ function resolveCliInput(body: OpenAIChatRequest): {
   cliInput: ReturnType<typeof openaiToCli>;
   sessionKey: string | undefined;
   resume: boolean;
+  persistSession: boolean;
 } {
   // Kimi may identify a conversation via `user` or `prompt_cache_key`.
   // We use that as our in-memory lookup key, but Claude CLI requires a
@@ -60,22 +87,78 @@ function resolveCliInput(body: OpenAIChatRequest): {
   const sessionKey =
     body.user || (body as { prompt_cache_key?: string }).prompt_cache_key;
   const existing = sessionKey ? getSession(sessionKey) : undefined;
-
-  // Delegate mode: always send the full history. --resume loses context when
-  // combined with --system-prompt-file, causing the model to repeat the same
-  // tool call over and over.
   const delegateMode = !!body.tools?.length;
-  if (existing && !delegateMode) {
-    const cliInput = openaiToCliDelta(body, existing.messageCount);
-    cliInput.sessionId = existing.claudeSessionId;
-    return { cliInput, sessionKey, resume: true };
+
+  if (existing) {
+    // Resume the persisted CLI session — including delegate (tools) mode.
+    // Previously delegate mode always replayed the full history into a
+    // fresh --session-id, forcing Anthropic to cache-write the entire
+    // growing conversation on every tool round-trip (O(N²) cost). Verified
+    // with Claude CLI 2.1.x: --resume + --system-prompt-file re-applies the
+    // system prompt and the CLI remembers its own prior turns, so only the
+    // delta messages need to be sent.
+    //
+    // The delta is only safe when Kimi's history still matches what the CLI
+    // session saw: Kimi web may trim/summarize old messages, which shifts
+    // indices and would silently drop context from the delta. Validate
+    // before trusting it; otherwise restart the session from full history.
+    const deltaValid = isDeltaValid(body, existing.messageCount, delegateMode);
+    if (deltaValid && acquireSession(sessionKey as string)) {
+      const cliInput = openaiToCliDelta(body, existing.messageCount);
+      cliInput.sessionId = existing.claudeSessionId;
+      return { cliInput, sessionKey, resume: true, persistSession: true };
+    }
+
+    if (deltaValid) {
+      // Key is held by an in-flight request (parallel agents sharing a key).
+      // Replaying full history under a fresh session is correct but must not
+      // clobber the stored entry owned by the in-flight conversation.
+      logger.warn("[Session] Key busy, falling back to full history without resume", {
+        sessionKey,
+      });
+      const cliInput = openaiToCli(body);
+      cliInput.sessionId = uuidv4();
+      return { cliInput, sessionKey: undefined, resume: false, persistSession: false };
+    }
+
+    logger.warn("[Session] Delta validation failed, restarting session from full history", {
+      sessionKey,
+      messageCount: body.messages.length,
+      sinceIndex: existing.messageCount,
+      delegateMode,
+    });
+    clearSession(sessionKey as string);
+    const cliInput = openaiToCli(body);
+    cliInput.sessionId = uuidv4();
+    return { cliInput, sessionKey, resume: false, persistSession: true };
   }
 
   const cliInput = openaiToCli(body);
   if (sessionKey) {
     cliInput.sessionId = uuidv4(); // pin a known UUID so we can --resume it later
   }
-  return { cliInput, sessionKey, resume: false };
+  return { cliInput, sessionKey, resume: false, persistSession: true };
+}
+
+/**
+ * A resumed CLI session already contains everything up to `sinceIndex`
+ * (the CLI generated those turns itself). The delta is trustworthy only if
+ * the sliced messages look like a normal append:
+ * - indices in range and the slice is non-empty;
+ * - in delegate mode, at least one tool result (every delegate round-trip
+ *   appends an assistant tool_call + a tool message).
+ */
+function isDeltaValid(
+  body: OpenAIChatRequest,
+  sinceIndex: number,
+  delegateMode: boolean
+): boolean {
+  if (!Number.isInteger(sinceIndex) || sinceIndex < 0) return false;
+  if (sinceIndex >= body.messages.length) return false;
+  const slice = body.messages.slice(sinceIndex);
+  if (slice.length === 0) return false;
+  if (delegateMode && !slice.some((m) => m.role === "tool")) return false;
+  return true;
 }
 
 /**
@@ -105,9 +188,15 @@ export async function handleChatCompletions(
     }
 
     // Convert to CLI input format, resuming a persisted session when we have one
-    const { cliInput, sessionKey, resume } = resolveCliInput(body);
+    const { cliInput, sessionKey, resume, persistSession } = resolveCliInput(body);
     const subprocess = new ClaudeSubprocess();
-    const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
+    const sessionCtx: SessionContext = {
+      sessionKey,
+      resume,
+      messageCount: body.messages.length,
+      persistSession,
+      lockHeld: resume && !!sessionKey,
+    };
 
     logger.info("[ChatCompletions] Request prepared", {
       requestId,
@@ -203,11 +292,13 @@ async function handleStreamingResponse(
       finished = true;
       // The CLI exits by itself in --print mode once the result is printed.
       // Give it a short grace period to shut down cleanly (flushing its
-      // session transcript) and only kill it if it hangs.
+      // session transcript — needed for the next turn's --resume) and only
+      // kill it if it hangs. The per-key inflight lock serializes follow-up
+      // requests, so a short grace is safe.
       const grace = setTimeout(() => {
         logger.debug("Grace period expired, killing subprocess", { requestId });
         subprocess.kill();
-      }, 3000);
+      }, 1000);
       grace.unref();
       subprocess.once("close", () => clearTimeout(grace));
       resolve();
@@ -268,9 +359,7 @@ async function handleStreamingResponse(
       isComplete = true;
       // Persist the session before killing the subprocess so the next turn can
       // --resume and continue the conversation instead of cold-starting.
-      if (sessionCtx.sessionKey && cliInput.sessionId) {
-        setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
-      }
+      persistSessionAndRelease(sessionCtx, cliInput);
       finish();
       return true;
     }
@@ -387,15 +476,23 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
-      if (sessionCtx.sessionKey && cliInput.sessionId) {
-        setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
-      }
+      persistSessionAndRelease(sessionCtx, cliInput);
+      const totals = addUsage(sessionCtx.sessionKey, {
+        cacheRead: result.usage?.cache_read_input_tokens,
+        cacheCreate: result.usage?.cache_creation_input_tokens,
+        output: result.usage?.output_tokens,
+      });
       logger.info("[Streaming] CLI result usage", {
         requestId,
+        resume: sessionCtx.resume,
+        deltaChars: cliInput.prompt.length,
         input: result.usage?.input_tokens,
         output: result.usage?.output_tokens,
         cacheRead: result.usage?.cache_read_input_tokens,
         cacheCreate: result.usage?.cache_creation_input_tokens,
+        ...(totals
+          ? { convCacheRead: totals.cacheRead, convCacheCreate: totals.cacheCreate, convOutput: totals.output, convSteps: totals.steps }
+          : {}),
       });
 
       if (res.writableEnded) {
@@ -480,6 +577,7 @@ async function handleStreamingResponse(
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
       }
+      releaseLock(sessionCtx);
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
@@ -498,6 +596,7 @@ async function handleStreamingResponse(
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
         }
+        releaseLock(sessionCtx);
         if (!res.writableEnded) {
           // Abnormal exit without result - send error
           res.write(`data: ${JSON.stringify({
@@ -522,6 +621,7 @@ async function handleStreamingResponse(
       delegateTools: delegateMode,
     }).catch((err) => {
       logger.error("[Streaming] Subprocess start error", { requestId, error: err.message });
+      releaseLock(sessionCtx);
       reject(err);
     });
   });
@@ -553,6 +653,23 @@ async function handleNonStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
+      const totals = addUsage(sessionCtx.sessionKey, {
+        cacheRead: result.usage?.cache_read_input_tokens,
+        cacheCreate: result.usage?.cache_creation_input_tokens,
+        output: result.usage?.output_tokens,
+      });
+      logger.info("[NonStreaming] CLI result usage", {
+        requestId,
+        resume: sessionCtx.resume,
+        deltaChars: cliInput.prompt.length,
+        input: result.usage?.input_tokens,
+        output: result.usage?.output_tokens,
+        cacheRead: result.usage?.cache_read_input_tokens,
+        cacheCreate: result.usage?.cache_creation_input_tokens,
+        ...(totals
+          ? { convCacheRead: totals.cacheRead, convCacheCreate: totals.cacheCreate, convOutput: totals.output, convSteps: totals.steps }
+          : {}),
+      });
     });
 
     subprocess.on("error", (error: Error) => {
@@ -560,6 +677,7 @@ async function handleNonStreamingResponse(
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
       }
+      releaseLock(sessionCtx);
       res.status(500).json({
         error: {
           message: error.message,
@@ -572,9 +690,7 @@ async function handleNonStreamingResponse(
 
     subprocess.on("close", (code: number | null) => {
       if (finalResult) {
-        if (sessionCtx.sessionKey && cliInput.sessionId) {
-          setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
-        }
+        persistSessionAndRelease(sessionCtx, cliInput);
         const delegations = delegateMode ? parseDelegations(finalResult.result || "") : [];
         if (delegations.length > 0) {
           const toolCalls = delegationsToToolCalls(delegations, "call", body.tools);
@@ -659,6 +775,7 @@ async function handleNonStreamingResponse(
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
         }
+        releaseLock(sessionCtx);
         if (!res.headersSent) {
           res.status(500).json({
             error: {
@@ -683,6 +800,7 @@ async function handleNonStreamingResponse(
       })
       .catch((error) => {
         logger.error("[NonStreaming] Subprocess start error", { requestId, error: error.message });
+        releaseLock(sessionCtx);
         res.status(500).json({
           error: {
             message: error.message,
