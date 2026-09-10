@@ -309,8 +309,10 @@ async function handleStreamingResponse(
     let isComplete = false;
     let hasEmittedText = false;
     let textBuffer = "";
+    let lastInvokeCloseCount = 0;
     let delegateEmitted = false;
     let finished = false;
+    const rejectedToolNames = new Set<string>();
 
     function finish() {
       if (finished) return;
@@ -333,7 +335,13 @@ async function handleStreamingResponse(
       const delegations = parseDelegations(textBuffer);
       if (delegations.length === 0) return false;
 
-      const toolCalls = delegationsToToolCalls(delegations, "call", body.tools);
+      const toolCalls = delegationsToToolCalls(delegations, "call", body.tools, rejectedToolNames);
+      if (toolCalls.length === 0) {
+        // All parsed delegations were rejected (unknown tool names). Treat the
+        // response as plain text so the client sees the model's words instead of
+        // an empty tool_calls block.
+        return false;
+      }
       logger.info("[Streaming] Delegations detected", {
         requestId,
         count: toolCalls.length,
@@ -459,8 +467,16 @@ async function handleStreamingResponse(
       if (delegateMode) {
         textBuffer += text;
         // Check whether a complete Kimi-style <invoke> block has arrived.
-        if (textBuffer.includes("</invoke>") && emitDelegateAndEnd()) {
-          return;
+        // Count closing tags instead of re-scanning on every delta: once we
+        // have parsed all blocks for the current set of closes, do not re-parse
+        // until a new </invoke> appears. This avoids quadratic scans and log spam
+        // when the model quotes invoke syntax and then continues with plain text.
+        const invokeCloseCount = (textBuffer.match(/<\/invoke>/g) || []).length;
+        if (invokeCloseCount > lastInvokeCloseCount) {
+          lastInvokeCloseCount = invokeCloseCount;
+          if (emitDelegateAndEnd()) {
+            return;
+          }
         }
       } else {
         const chunk = {
@@ -730,8 +746,8 @@ async function handleNonStreamingResponse(
       if (finalResult) {
         persistSessionAndRelease(sessionCtx, cliInput);
         const delegations = delegateMode ? parseDelegations(finalResult.result || "") : [];
-        if (delegations.length > 0) {
-          const toolCalls = delegationsToToolCalls(delegations, "call", body.tools);
+        const toolCalls = delegations.length > 0 ? delegationsToToolCalls(delegations, "call", body.tools) : [];
+        if (toolCalls.length > 0) {
           logger.info("[NonStreaming] Delegations detected", {
             requestId,
             count: toolCalls.length,

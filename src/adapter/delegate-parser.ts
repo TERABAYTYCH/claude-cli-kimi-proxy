@@ -13,6 +13,7 @@
  */
 
 import type { OpenAIToolCall, OpenAIToolDefinition } from "../types/openai.js";
+import { logger } from "../utils/logger.js";
 
 export interface DelegationRequest {
   tool: string;
@@ -21,6 +22,8 @@ export interface DelegationRequest {
 
 const INVOKE_RE = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/g;
 const PARAMETER_RE = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/g;
+const CODE_BLOCK_RE = /```[\s\S]*?```/g;
+const TOOL_RESULT_BLOCK_RE = /<tool_result>[\s\S]*?<\/tool_result>/g;
 
 /**
  * Common aliases Claude may use for Kimi tool names. Keys must be lowercase.
@@ -83,12 +86,15 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
 
 /**
  * Normalize a tool name from Claude's output to the exact Kimi tool name.
- * Falls back to the original name if no alias or allowed match is found.
+ *
+ * If `allowedTools` is provided and the name is not a known alias and is not
+ * present in the allowed list, returns `null`. This prevents a hallucinated
+ * tool name from being forwarded as a real tool_call and burning a round-trip.
  */
 export function normalizeToolName(
   name: string,
   allowedTools?: string[]
-): string {
+): string | null {
   const key = name.toLowerCase();
   const aliased = TOOL_NAME_ALIASES[key];
   if (aliased) return aliased;
@@ -98,6 +104,9 @@ export function normalizeToolName(
     if (exact) return exact;
     const caseMatch = allowedTools.find((t) => t.toLowerCase() === key);
     if (caseMatch) return caseMatch;
+
+    // Unknown tool name in a constrained caller context — reject it.
+    return null;
   }
 
   return name;
@@ -217,11 +226,22 @@ function parseInvokeBlock(block: string): DelegationRequest | null {
   return { tool, params };
 }
 
+export function stripQuotedInvokes(text: string): string {
+  return text
+    .replace(CODE_BLOCK_RE, "")
+    .replace(TOOL_RESULT_BLOCK_RE, "");
+}
+
 export function parseDelegations(text: string): DelegationRequest[] {
   const results: DelegationRequest[] = [];
   let match: RegExpExecArray | null;
 
-  while ((match = INVOKE_RE.exec(text)) !== null) {
+  // Ignore invoke examples embedded in fenced code blocks or previous
+  // <tool_result> blocks. The model often quotes its own instruction or
+  // history, and those must not be treated as live delegations.
+  const executableText = stripQuotedInvokes(text);
+
+  while ((match = INVOKE_RE.exec(executableText)) !== null) {
     const block = match[0];
     const parsed = parseInvokeBlock(block);
     if (parsed) results.push(parsed);
@@ -234,25 +254,40 @@ export function parseDelegations(text: string): DelegationRequest[] {
 export function delegationsToToolCalls(
   delegations: DelegationRequest[],
   idPrefix = "call",
-  tools?: OpenAIToolDefinition[]
+  tools?: OpenAIToolDefinition[],
+  rejectedNames?: Set<string>
 ): OpenAIToolCall[] {
   const allowedTools = tools?.map((t) => t.function.name);
   const byName = new Map(tools?.map((t) => [t.function.name, t]));
 
-  return delegations.map((d, index) => {
+  const results: OpenAIToolCall[] = [];
+  for (const d of delegations) {
     const name = normalizeToolName(d.tool, allowedTools);
+    if (name === null) {
+      if (!rejectedNames?.has(d.tool)) {
+        logger.warn("[DelegateParser] Dropping delegation with unknown tool name", {
+          originalName: d.tool,
+          allowedTools,
+        });
+        rejectedNames?.add(d.tool);
+      }
+      continue;
+    }
+
     const toolDef = byName.get(name);
     const coerced = coerceParamsWithSchema(d.params, toolDef);
 
-    return {
-      id: `${idPrefix}_${index}`,
+    results.push({
+      id: `${idPrefix}_${results.length}`,
       type: "function",
       function: {
         name,
         arguments: JSON.stringify(coerced),
       },
-    };
-  });
+    });
+  }
+
+  return results;
 }
 
 export function stripDelegations(text: string): string {
