@@ -14,6 +14,7 @@ Thumbs.db
 
 # IDE
 .vscode/
+.vscode-screenshots/
 .idea/
 *.swp
 *.swo
@@ -27,3 +28,7 @@ coverage/
 
 # Local dev convenience scripts
 start-proxy.bat
+
+# Persisted session map (survives restarts, per-environment)
+.claude-max-api-proxy-sessions.json
+.claude-max-api-proxy-sessions.json.tmp
