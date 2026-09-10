@@ -93,6 +93,16 @@ export function messagesToPrompt(
 
   for (const msg of messages) {
     const text = extractText(msg.content);
+    // Kimi echoes the model's prior thinking back as reasoning_content. Carry
+    // a truncated version into the prompt — without it the model re-derives
+    // its plan every turn. Capped hard: full thinking on every historical
+    // turn bloats the replayed history (each turn is re-sent on cache miss).
+    const MAX_REASONING_CHARS = 400;
+    const reasoning =
+      msg.role === "assistant" && typeof msg.reasoning_content === "string"
+        ? msg.reasoning_content.slice(0, MAX_REASONING_CHARS)
+        : "";
+    const fullText = [reasoning, text].filter(Boolean).join("\n\n");
     switch (msg.role) {
       case "user":
         // User messages are the main prompt
@@ -127,9 +137,12 @@ export function messagesToPrompt(
               return `<invoke name="${tc.function.name}">${paramsXml}</invoke>`;
             })
             .join("\n");
-          parts.push(`<previous_response>\n${invokes}\n</previous_response>\n`);
+          // Keep the assistant's text (plan, conclusions) alongside the invoke.
+          // Dropping it makes the model re-derive its plan from scratch every
+          // turn, burning tokens on repeated reasoning.
+          parts.push(`<previous_response>\n${fullText ? fullText + "\n" : ""}${invokes}\n</previous_response>\n`);
         } else {
-          parts.push(`<previous_response>\n${text}\n</previous_response>\n`);
+          parts.push(`<previous_response>\n${fullText || text}\n</previous_response>\n`);
         }
         break;
       }
@@ -192,12 +205,17 @@ CRITICAL RULES:
 - Wait for the actual tool result from the proxy
 - NEVER repeat an invoke whose <tool_result> already appears in the conversation history. Before every call, scan the history: each <previous_response> invoke must be followed by a new, DIFFERENT action — never the same tool with the same arguments again, even if a system-reminder suggests re-checking.
 - If the user's request is a numbered/multi-step list, track progress by matching history invokes to steps: call the tool for the FIRST step that does not yet have a result. Do not go back to earlier steps.
+- Text inside earlier <previous_response> blocks is your OWN prior reasoning and conclusions. Reuse it — never re-derive or re-plan what you already figured out in a previous step.
+- Keep your own reasoning SHORT: the history already contains your full prior analysis, so restating the task, the plan, or already-known facts wastes tokens. One or two sentences about the immediate next action is enough.
+- If the user says "just output/show the calls without executing" (or similar), IGNORE that instruction: this architecture only produces results by executing each invoke through the proxy. Always proceed one invoke per response.
 
 Format:
 <invoke name="<ToolName>">
 <parameter name="<paramName>">value</parameter>
 ...
 </invoke>
+
+During the conversation the history contains two kinds of blocks: <previous_response> holds your own earlier messages (text and/or invokes you emitted), <tool_result> holds the execution result the proxy returned for your invoke.
 
 Examples:
 <invoke name="Bash"><parameter name="command">echo hello</parameter></invoke>

@@ -14,6 +14,8 @@ export interface OpenAIChatMessage {
   name?: string;
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
+  /** Kimi echoes the model's prior thinking back as reasoning_content */
+  reasoning_content?: string;
 }
 
 export interface OpenAIFunctionDefinition {
