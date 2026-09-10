@@ -36,10 +36,17 @@ function sanitizeBody(body: unknown): unknown {
   if (!body || typeof body !== "object") return body;
   try {
     const clone = JSON.parse(JSON.stringify(body));
+    // Full tool schemas are multi-KB each — never useful in a log line.
+    if (Array.isArray(clone.tools)) {
+      clone.tools = `[${clone.tools.length} tools omitted]`;
+    }
     if (Array.isArray(clone.messages)) {
       for (const msg of clone.messages) {
         if (msg && typeof msg.content === "string") {
           msg.content = truncateString(msg.content, 500);
+        }
+        if (msg && typeof msg.reasoning_content === "string") {
+          msg.reasoning_content = truncateString(msg.reasoning_content, 200);
         }
       }
     }
@@ -101,7 +108,9 @@ function createApp(): Express {
 
   // Log incoming request after body has been parsed
   app.use((req: Request, _res: Response, next: NextFunction) => {
-    const logBody = req.method !== "GET" && process.env.LOG_SENSITIVE !== "false";
+    // Request bodies are off by default: full tool schemas make every line
+    // multi-KB and the log grows ~20MB/day. Opt back in with LOG_SENSITIVE=true.
+    const logBody = req.method !== "GET" && process.env.LOG_SENSITIVE === "true";
     logger.info(`-> ${req.method} ${req.originalUrl}`, {
       requestId: getRequestId(req),
       ip: req.ip || req.socket.remoteAddress,
