@@ -85,6 +85,21 @@ export function createUsageChunk(
 }
 
 /**
+ * Check if the Claude CLI result represents a rate limit or quota error.
+ * In these cases we should return HTTP 429 instead of a fake 200 so the
+ * upstream client (Kimi) knows not to retry.
+ */
+export function isRateLimitError(result: ClaudeCliResult): boolean {
+  return (
+    result.is_error === true &&
+    (result.api_error_status === 429 ||
+      result.result?.includes("session limit") ||
+      result.result?.includes("rate limit") ||
+      result.result?.includes("rate_limit"))
+  );
+}
+
+/**
  * Convert Claude CLI result to OpenAI non-streaming response
  */
 export function cliResultToOpenai(

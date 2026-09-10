@@ -11,6 +11,7 @@ import { openaiToCli, openaiToCliDelta } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
+  isRateLimitError,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
 import {
@@ -380,6 +381,26 @@ async function handleStreamingResponse(
         }
       }
 
+      // If the CLI returned a rate limit error, send it as an SSE error so
+      // the client knows not to retry.
+      if (isRateLimitError(result)) {
+        logger.warn("[Streaming] Rate limit error", {
+          requestId,
+          result: result.result,
+        });
+        res.write(`data: ${JSON.stringify({
+          error: {
+            message: result.result || "Rate limit exceeded",
+            type: "rate_limit_error",
+            code: "rate_limit",
+          },
+        })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        finish();
+        return;
+      }
+
       // Send final done chunk with finish_reason and usage data
       const doneChunk = createDoneChunk(requestId, lastModel);
       if (result.usage) {
@@ -535,6 +556,22 @@ async function handleNonStreamingResponse(
           });
           res.json(response);
         } else {
+          if (isRateLimitError(finalResult)) {
+            logger.warn("[NonStreaming] Rate limit error", {
+              requestId,
+              result: finalResult.result,
+            });
+            res.status(429).json({
+              error: {
+                message: finalResult.result || "Rate limit exceeded",
+                type: "rate_limit_error",
+                code: "rate_limit",
+              },
+            });
+            resolve();
+            return;
+          }
+
           logger.info("[NonStreaming] Returning text response", {
             requestId,
             hasContent: !!finalResult.result,

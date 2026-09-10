@@ -80,6 +80,7 @@ export interface ClaudeCliResult {
   result: string;
   session_id: string;
   total_cost_usd: number;
+  api_error_status?: number | null;
   usage: {
     input_tokens: number;
     output_tokens: number;
