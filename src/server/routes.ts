@@ -16,6 +16,7 @@ import {
   buildOpenAIUsage,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession, acquireSessionWait, releaseSession, addUsage } from "../subprocess/session-store.js";
+import { checkResumeDeltaHealth } from "../session/resume-delta-guard.js";
 import {
   parseDelegations,
   delegationsToToolCalls,
@@ -254,16 +255,12 @@ export async function handleChatCompletions(
 
     // Task 3 guardrail: a "delta" that stopped being a delta silently kills
     // the resume savings (measured: 77-98k char prompts on resumed turns).
-    // Log loudly; do not change behavior.
-    const DELTA_SOFT_LIMIT = 20000; // chars
-    if (resume && cliInput.prompt.length > DELTA_SOFT_LIMIT) {
-      logger.warn("[Session] Delta unexpectedly large — resume savings lost", {
-        sessionKey,
-        promptChars: cliInput.prompt.length,
-        sinceIndex: diag?.sinceIndex,
-        messagesLen: body.messages.length,
-      });
-    }
+    // Check structural regressions first; keep a soft size backstop for the
+    // same failure mode. Log loudly; do not change behavior.
+    checkResumeDeltaHealth(cliInput.prompt, resume, sessionKey, {
+      sinceIndex: diag?.sinceIndex,
+      messagesLen: body.messages.length,
+    });
 
     logger.info("[ChatCompletions] Request prepared", {
       requestId,
