@@ -610,11 +610,18 @@ async function handleStreamingResponse(
       // Send final done chunk with finish_reason and usage data
       const doneChunk = createDoneChunk(requestId, lastModel);
       if (result.usage) {
+        const input = result.usage.input_tokens || 0;
+        const output = result.usage.output_tokens || 0;
+        const cacheRead = result.usage.cache_read_input_tokens || 0;
+        const cacheCreate = result.usage.cache_creation_input_tokens || 0;
+        const promptTokens = input + cacheRead + cacheCreate;
         doneChunk.usage = {
-          prompt_tokens: result.usage.input_tokens || 0,
-          completion_tokens: result.usage.output_tokens || 0,
-          total_tokens:
-            (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
+          prompt_tokens: promptTokens,
+          completion_tokens: output,
+          total_tokens: promptTokens + output,
+          prompt_tokens_details: {
+            cached_tokens: cacheRead,
+          },
         };
       }
       res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
@@ -769,12 +776,7 @@ async function handleNonStreamingResponse(
                 finish_reason: "tool_calls" as const,
               },
             ],
-            usage: {
-              prompt_tokens: finalResult.usage?.input_tokens || 0,
-              completion_tokens: finalResult.usage?.output_tokens || 0,
-              total_tokens:
-                (finalResult.usage?.input_tokens || 0) + (finalResult.usage?.output_tokens || 0),
-            },
+            usage: buildOpenAIUsage(finalResult.usage),
           };
           logger.info("[NonStreaming] Returning tool_calls", {
             requestId,

@@ -85,6 +85,32 @@ export function createUsageChunk(
 }
 
 /**
+ * Build OpenAI-compatible usage from CLI usage fields.
+ *
+ * OpenAI convention: prompt_tokens is the entire input, including cached and
+ * newly-created cache portions. cached_tokens inside prompt_tokens_details
+ * exposes the cache-read portion so clients can reason about context size.
+ */
+export function buildOpenAIUsage(
+  usage: ClaudeCliResult["usage"] | undefined
+): OpenAIChatResponse["usage"] {
+  const input = usage?.input_tokens || 0;
+  const output = usage?.output_tokens || 0;
+  const cacheRead = usage?.cache_read_input_tokens || 0;
+  const cacheCreate = usage?.cache_creation_input_tokens || 0;
+  const promptTokens = input + cacheRead + cacheCreate;
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: output,
+    total_tokens: promptTokens + output,
+    prompt_tokens_details: {
+      cached_tokens: cacheRead,
+    },
+  };
+}
+
+/**
  * Check if the Claude CLI result represents a rate limit or quota error.
  * In these cases we should return HTTP 429 instead of a fake 200 so the
  * upstream client (Kimi) knows not to retry.
@@ -189,12 +215,7 @@ export function cliResultToOpenai(
         finish_reason: "stop",
       },
     ],
-    usage: {
-      prompt_tokens: result.usage?.input_tokens || 0,
-      completion_tokens: result.usage?.output_tokens || 0,
-      total_tokens:
-        (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
-    },
+    usage: buildOpenAIUsage(result.usage),
   };
 }
 
