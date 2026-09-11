@@ -14,7 +14,97 @@ interface SessionEntry {
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours of inactivity
 const PRUNE_INTERVAL_MS = 30 * 60 * 1000; // sweep every 30 minutes
 
-const sessions = new Map<string, SessionEntry>();
+/**
+ * Persistent backing for the session map. Default location is the current
+ * working directory, NOT $HOME: ClaudeSubprocess.start runs the CLI with
+ * cwd: options.cwd || process.cwd(), and Claude CLI stores transcripts under
+ * ~/.claude/projects/<slug>/<session-id>.jsonl keyed by the project cwd. A
+ * session UUID recorded while running in directory A will not resume from
+ * directory B, so a global $HOME file would silently mix unrelated projects
+ * and fall back to full-history replay. PROXY_SESSIONS_FILE overrides the
+ * path when the operator wants a custom location.
+ *
+ * The inflight lock map is intentionally NOT persisted: a lock held by a dead
+ * process would block a key until TTL theft kicks in.
+ */
+const SESSIONS_FILE =
+  process.env.PROXY_SESSIONS_FILE ||
+  path.join(process.cwd(), ".claude-max-api-proxy-sessions.json");
+
+function loadSessions(): Map<string, SessionEntry> {
+  const map = new Map<string, SessionEntry>();
+  try {
+    const raw = fs.readFileSync(SESSIONS_FILE, "utf8");
+    const data = JSON.parse(raw) as Record<string, SessionEntry>;
+    const now = Date.now();
+    let dropped = 0;
+    for (const [key, entry] of Object.entries(data)) {
+      if (now - entry.lastUsed > SESSION_TTL_MS) {
+        dropped++;
+        continue;
+      }
+      map.set(key, entry);
+    }
+    logger.info("[SessionStore] Loaded persisted sessions", {
+      file: SESSIONS_FILE,
+      count: map.size,
+      dropped,
+    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      logger.info("[SessionStore] No persisted sessions file, starting empty", {
+        file: SESSIONS_FILE,
+      });
+    } else {
+      logger.warn("[SessionStore] Failed to load persisted sessions, starting empty", {
+        file: SESSIONS_FILE,
+        error: (err as Error).message,
+      });
+    }
+  }
+  return map;
+}
+
+let persistPromise: Promise<void> | null = null;
+let persistDirty = false;
+
+async function persistSessionsOnce(): Promise<void> {
+  const data: Record<string, SessionEntry> = {};
+  for (const [key, entry] of sessions) {
+    data[key] = entry;
+  }
+  const tmp = `${SESSIONS_FILE}.tmp`;
+  await fs.promises.writeFile(tmp, JSON.stringify(data, null, 2));
+  await fs.promises.rename(tmp, SESSIONS_FILE);
+}
+
+/**
+ * Fire-and-forget persistence. Serialized so rapid setSession/clearSession
+ * calls cannot interleave and write stale state.
+ */
+function persistSessions(): void {
+  if (persistPromise) {
+    persistDirty = true;
+    return;
+  }
+  persistPromise = (async () => {
+    do {
+      persistDirty = false;
+      try {
+        await persistSessionsOnce();
+      } catch (err) {
+        logger.warn("[SessionStore] Failed to persist sessions", {
+          file: SESSIONS_FILE,
+          error: (err as Error).message,
+        });
+      }
+    } while (persistDirty);
+    persistPromise = null;
+  })();
+}
+
+const sessions = loadSessions();
 
 /**
  * Keys currently being driven by an in-flight request. Two concurrent

@@ -13,8 +13,9 @@ import {
   createDoneChunk,
   isRateLimitError,
   rateLimitRetryAfter,
+  buildOpenAIUsage,
 } from "../adapter/cli-to-openai.js";
-import { getSession, setSession, clearSession, acquireSession, releaseSession, addUsage } from "../subprocess/session-store.js";
+import { getSession, setSession, clearSession, acquireSessionWait, releaseSession, addUsage } from "../subprocess/session-store.js";
 import {
   parseDelegations,
   delegationsToToolCalls,
@@ -89,21 +90,55 @@ function releaseLock(sessionCtx: SessionContext): void {
  * when we have one for this `request.user` key instead of replaying the
  * full message history on every turn.
  */
-function resolveCliInput(body: OpenAIChatRequest): {
+async function resolveCliInput(body: OpenAIChatRequest): Promise<{
   cliInput: ReturnType<typeof openaiToCli>;
   sessionKey: string | undefined;
   resume: boolean;
   persistSession: boolean;
   /** True if this request holds the per-key inflight lock (see session-store). */
   lockHeld: boolean;
-} {
+  /** sinceIndex of the resumed session + roles of the sliced delta (R2 diag). */
+  diag?: { sinceIndex: number; sliceRoles: string[] };
+}> {
   // Kimi may identify a conversation via `user` or `prompt_cache_key`.
   // We use that as our in-memory lookup key, but Claude CLI requires a
   // valid UUID for --session-id / --resume, so we keep a separate UUID.
   const sessionKey =
     body.user || (body as { prompt_cache_key?: string }).prompt_cache_key;
-  const existing = sessionKey ? getSession(sessionKey) : undefined;
   const delegateMode = !!body.tools?.length;
+
+  if (!sessionKey) {
+    const cliInput = openaiToCli(body);
+    return { cliInput, sessionKey, resume: false, persistSession: false, lockHeld: false };
+  }
+
+  // Serialize turns of one conversation: wait for the previous request to
+  // release the key (it is held until the subprocess exits and flushes its
+  // transcript). Kimi sends the next turn ~15ms after our SSE ends, while
+  // the lock outlives it by ~0.5s — an instant fallback here would turn
+  // every other turn into a full-history replay (measured: 4 duplicates
+  // costing 94k cache-creation tokens in one live run) and desync the
+  // resumed session, because the fallback process generates invokes the
+  // resumed session never saw. A few hundred ms of waiting avoids both.
+  const LOCK_WAIT_MS = 8000;
+  const acquired = await acquireSessionWait(sessionKey, LOCK_WAIT_MS);
+
+  if (!acquired) {
+    // Key held by a genuinely long-running request (parallel agents sharing
+    // a key). Run unlocked with a fresh session and don't persist, so we
+    // don't clobber the stored entry owned by the in-flight conversation.
+    logger.warn("[Session] Key busy after wait, falling back to full history without resume", {
+      sessionKey,
+      waitMs: LOCK_WAIT_MS,
+    });
+    const cliInput = openaiToCli(body);
+    cliInput.sessionId = uuidv4();
+    return { cliInput, sessionKey: undefined, resume: false, persistSession: false, lockHeld: false };
+  }
+
+  // Read the session AFTER acquiring: the previous request may have just
+  // persisted a newer entry while we were waiting for the lock.
+  const existing = getSession(sessionKey);
 
   if (existing) {
     // Resume the persisted CLI session — including delegate (tools) mode.
@@ -184,6 +219,17 @@ export async function handleChatCompletions(
   const body = req.body as OpenAIChatRequest;
   const stream = body.stream === true;
 
+  // Holds the per-key inflight lock if resolveCliInput acquires one. Kept in
+  // this outer scope so the catch block can release it if anything throws
+  // after acquisition but before the subprocess handlers take over.
+  const sessionCtx: SessionContext = {
+    sessionKey: undefined,
+    resume: false,
+    messageCount: 0,
+    persistSession: false,
+    lockHeld: false,
+  };
+
   try {
     // Validate request
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -198,26 +244,56 @@ export async function handleChatCompletions(
     }
 
     // Convert to CLI input format, resuming a persisted session when we have one
-    const { cliInput, sessionKey, resume, persistSession, lockHeld } = resolveCliInput(body);
+    const { cliInput, sessionKey, resume, persistSession, lockHeld, diag } = await resolveCliInput(body);
     const subprocess = new ClaudeSubprocess();
-    const sessionCtx: SessionContext = {
-      sessionKey,
-      resume,
-      messageCount: body.messages.length,
-      persistSession,
-      lockHeld,
-    };
+    sessionCtx.sessionKey = sessionKey;
+    sessionCtx.resume = resume;
+    sessionCtx.messageCount = body.messages.length;
+    sessionCtx.persistSession = persistSession;
+    sessionCtx.lockHeld = lockHeld;
+
+    // Task 3 guardrail: a "delta" that stopped being a delta silently kills
+    // the resume savings (measured: 77-98k char prompts on resumed turns).
+    // Log loudly; do not change behavior.
+    const DELTA_SOFT_LIMIT = 20000; // chars
+    if (resume && cliInput.prompt.length > DELTA_SOFT_LIMIT) {
+      logger.warn("[Session] Delta unexpectedly large — resume savings lost", {
+        sessionKey,
+        promptChars: cliInput.prompt.length,
+        sinceIndex: diag?.sinceIndex,
+        messagesLen: body.messages.length,
+      });
+    }
 
     logger.info("[ChatCompletions] Request prepared", {
       requestId,
       stream,
       model: body.model,
       resume,
+      sessionKey,
       hasSessionKey: !!sessionKey,
       hasSystemPrompt: !!cliInput.systemPrompt,
       hasTools: !!body.tools?.length,
       toolNames: body.tools?.map((t) => t.function.name),
       promptPreview: cliInput.prompt.slice(0, 200),
+      promptChars: cliInput.prompt.length,
+      // The delegation instruction never appears in the prompt (it always
+      // goes via --system-prompt-file), so <tool_result> literals in the
+      // prompt are all real delta content.
+      toolResultBlocks: (cliInput.prompt.match(/<tool_result>/g) || []).length,
+      // Check only the prompt prefix: the identity must be at the start
+      // (via --system-prompt-file) when present. A literal further down is
+      // just source code the model read (e.g. routes.ts) and must not flag
+      // a false regression.
+      kimiSystemPresent: cliInput.prompt.slice(0, 500).includes("You are Kimi Code CLI"),
+      ...(diag
+        ? {
+            sinceIndex: diag.sinceIndex,
+            messagesLen: body.messages.length,
+            sliceLen: diag.sliceRoles.length,
+            sliceRoles: diag.sliceRoles,
+          }
+        : {}),
     });
 
     if (stream) {
@@ -228,6 +304,18 @@ export async function handleChatCompletions(
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[handleChatCompletions] Error:", message);
+
+    // If resolveCliInput acquired the per-key lock and we threw before the
+    // subprocess handlers were wired up, release it here. releaseLock is
+    // idempotent (uses the lockHeld flag), so it is safe even for requests
+    // that never held the lock.
+    if (sessionCtx.lockHeld) {
+      logger.warn("[ChatCompletions] Releasing inflight lock after error", {
+        requestId,
+        sessionKey: sessionCtx.sessionKey,
+      });
+      releaseLock(sessionCtx);
+    }
 
     if (!res.headersSent) {
       res.status(500).json({
