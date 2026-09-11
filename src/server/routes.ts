@@ -384,6 +384,7 @@ async function handleStreamingResponse(
     let textBuffer = "";
     let lastInvokeCloseCount = 0;
     let delegateEmitted = false;
+    const INVOKE_BATCH_LIMIT = 8;
     let finished = false;
     const rejectedToolNames = new Set<string>();
 
@@ -539,16 +540,17 @@ async function handleStreamingResponse(
 
       if (delegateMode) {
         textBuffer += text;
-        // Check whether a complete Kimi-style <invoke> block has arrived.
-        // Count closing tags instead of re-scanning on every delta: once we
-        // have parsed all blocks for the current set of closes, do not re-parse
-        // until a new </invoke> appears. This avoids quadratic scans and log spam
-        // when the model quotes invoke syntax and then continues with plain text.
+        // Collect the whole response so the model can batch independent invokes.
+        // Count closing tags to avoid re-parsing on every delta and as a safety
+        // cap: if the buffer ever exceeds INVOKE_BATCH_LIMIT closes, parse and
+        // emit immediately to prevent runaway generation.
         const invokeCloseCount = (textBuffer.match(/<\/invoke>/g) || []).length;
         if (invokeCloseCount > lastInvokeCloseCount) {
           lastInvokeCloseCount = invokeCloseCount;
-          if (emitDelegateAndEnd()) {
-            return;
+          if (invokeCloseCount >= INVOKE_BATCH_LIMIT) {
+            if (emitDelegateAndEnd()) {
+              return;
+            }
           }
         }
       } else {

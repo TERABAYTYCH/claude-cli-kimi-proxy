@@ -261,6 +261,7 @@ export function delegationsToToolCalls(
   const byName = new Map(tools?.map((t) => [t.function.name, t]));
 
   const results: OpenAIToolCall[] = [];
+  const seenKeys = new Set<string>();
   for (const d of delegations) {
     const name = normalizeToolName(d.tool, allowedTools);
     if (name === null) {
@@ -276,6 +277,15 @@ export function delegationsToToolCalls(
 
     const toolDef = byName.get(name);
     const coerced = coerceParamsWithSchema(d.params, toolDef);
+    const key = `${name}::${JSON.stringify(coerced)}`;
+    if (seenKeys.has(key)) {
+      logger.warn("[DelegateParser] Dropping duplicate delegation in the same response", {
+        tool: name,
+        arguments: coerced,
+      });
+      continue;
+    }
+    seenKeys.add(key);
 
     results.push({
       id: `${idPrefix}_${results.length}`,
