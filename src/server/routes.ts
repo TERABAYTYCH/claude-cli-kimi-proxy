@@ -118,71 +118,56 @@ function resolveCliInput(body: OpenAIChatRequest): {
     // session saw: Kimi web may trim/summarize old messages, which shifts
     // indices and would silently drop context from the delta. Validate
     // before trusting it; otherwise restart the session from full history.
-    const deltaValid = isDeltaValid(body, existing.messageCount, delegateMode);
-    if (deltaValid && acquireSession(sessionKey as string)) {
+    const deltaValid = isDeltaValid(body, existing.messageCount);
+    if (deltaValid) {
       const cliInput = openaiToCliDelta(body, existing.messageCount);
       cliInput.sessionId = existing.claudeSessionId;
-      return { cliInput, sessionKey, resume: true, persistSession: true, lockHeld: true };
-    }
-
-    if (deltaValid) {
-      // Key is held by an in-flight request (parallel agents sharing a key).
-      // Replaying full history under a fresh session is correct but must not
-      // clobber the stored entry owned by the in-flight conversation.
-      logger.warn("[Session] Key busy, falling back to full history without resume", {
-        sessionKey,
-      });
-      const cliInput = openaiToCli(body);
-      cliInput.sessionId = uuidv4();
-      return { cliInput, sessionKey: undefined, resume: false, persistSession: false, lockHeld: false };
+      return {
+        cliInput, sessionKey, resume: true, persistSession: true, lockHeld: true,
+        diag: {
+          sinceIndex: existing.messageCount,
+          sliceRoles: body.messages.slice(existing.messageCount).map((m) => m.role),
+        },
+      };
     }
 
     logger.warn("[Session] Delta validation failed, restarting session from full history", {
       sessionKey,
       messageCount: body.messages.length,
       sinceIndex: existing.messageCount,
-      delegateMode,
     });
-    clearSession(sessionKey as string);
+    clearSession(sessionKey);
     const cliInput = openaiToCli(body);
     cliInput.sessionId = uuidv4();
-    // Take the key for the restarted session so a parallel request cannot
-    // --resume it while it is being rebuilt. If the key is busy, run unlocked
-    // and without persisting — whoever holds the lock owns the stored entry.
-    if (acquireSession(sessionKey as string)) {
-      return { cliInput, sessionKey, resume: false, persistSession: true, lockHeld: true };
-    }
-    logger.warn("[Session] Key busy during delta-invalid restart, not persisting", {
-      sessionKey,
-    });
-    return { cliInput, sessionKey: undefined, resume: false, persistSession: false, lockHeld: false };
+    return { cliInput, sessionKey, resume: false, persistSession: true, lockHeld: true };
   }
 
+  // Fresh conversation under this key — build a session we can resume later.
   const cliInput = openaiToCli(body);
-  if (sessionKey) {
-    cliInput.sessionId = uuidv4(); // pin a known UUID so we can --resume it later
-  }
-  return { cliInput, sessionKey, resume: false, persistSession: true, lockHeld: false };
+  cliInput.sessionId = uuidv4(); // pin a known UUID so we can --resume it later
+  return { cliInput, sessionKey, resume: false, persistSession: true, lockHeld: true };
 }
 
 /**
  * A resumed CLI session already contains everything up to `sinceIndex`
  * (the CLI generated those turns itself). The delta is trustworthy only if
- * the sliced messages look like a normal append:
- * - indices in range and the slice is non-empty;
- * - in delegate mode, at least one tool result (every delegate round-trip
- *   appends an assistant tool_call + a tool message).
+ * the sliced messages look like a normal append: indices in range, slice
+ * non-empty, and it carries at least one new user or tool message.
+ *
+ * Previously delegate mode required a tool message in the slice, but that
+ * wrongly rejected plain follow-up questions in tool-enabled chats, forcing
+ * a full-history replay (~100x cost). Assistant-only slices are the only
+ * degenerate case we reject — they are just echoed model output.
  */
 function isDeltaValid(
   body: OpenAIChatRequest,
-  sinceIndex: number,
-  delegateMode: boolean
+  sinceIndex: number
 ): boolean {
   if (!Number.isInteger(sinceIndex) || sinceIndex < 0) return false;
   if (sinceIndex >= body.messages.length) return false;
   const slice = body.messages.slice(sinceIndex);
   if (slice.length === 0) return false;
-  if (delegateMode && !slice.some((m) => m.role === "tool")) return false;
+  if (!slice.some((m) => m.role === "tool" || m.role === "user")) return false;
   return true;
 }
 
