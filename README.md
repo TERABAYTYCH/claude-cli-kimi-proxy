@@ -12,6 +12,25 @@
 > conversation are serialised per key, and `prompt_tokens` reports cached input
 > so the client can manage its own context window.
 >
+> **Efficiency.** Measured against doing the same work in Claude Code directly,
+> on the same commit, with both sides given an identical task (see
+> [`tests/benchmark/`](tests/benchmark/README.md)):
+>
+> | task | direct | proxied | ratio |
+> |---|---:|---:|---:|
+> | short, ~10 tool calls | 67 158 | 89 785 | 1.34x |
+> | long, ~20 tool calls | 251 004 | **212 808** | **0.85x** |
+>
+> Figures are effective input tokens, `cache_creation × 1.25 + cache_read ×
+> 0.10 + input`. The proxy pays a one-time toll of roughly 45 000 tokens on the
+> first turn to write the caller's system prompt and tool map into cache, which
+> is half a short run and a fifth of a long one. Against that it batches
+> independent calls into single turns — thirteen round trips against twenty on
+> the long task — and every round trip avoided is one less re-read of the whole
+> accumulated context at 0.1x. The two effects cross over at roughly fifteen
+> tool calls: shorter tasks are cheaper handled directly, longer ones are
+> cheaper through the proxy.
+>
 > See [ARCHITECTURE.md](ARCHITECTURE.md) for the full request pipeline, the cost
 > model, and the design decisions that should not be re-opened.
 > [`tests/benchmark/`](tests/benchmark/README.md) measures proxied work against
