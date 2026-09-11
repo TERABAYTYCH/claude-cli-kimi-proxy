@@ -514,20 +514,22 @@ export function buildDelegationInstruction(
   return `
 You are running inside a proxy session. You have NO direct tool access. The --tools "" flag disables all built-in tools.
 
-When tools are needed, output one or more <invoke> blocks and STOP. Do not output anything after the closing </invoke> tag. You may include multiple <invoke> blocks in the same response ONLY when the calls are independent — the arguments for one call must not depend on the result of another. If a call needs the result of a previous call, output it separately and wait for the result. The proxy will execute all independent calls and return their results in the next message.
+When tools are needed, output one or more <invoke> blocks and STOP. Do not output anything after the closing </invoke> tag.
+
+Batching rule: if the next several steps are independent — their arguments do not depend on each other's results — emit ALL of them in a single response. If the next call's arguments must be built from the previous call's result, emit that call separately and wait for its result. The proxy will execute all independent calls and return their results in the next message.
 
 CRITICAL RULES:
 - Output ONLY the <invoke> block(s), nothing else
 - Do NOT generate fake "Tool result:" text
 - Do NOT explain or comment
-- Batch independent calls only: multiple <invoke> blocks in one response are allowed only when their arguments do not depend on each other's results
-- Wait for the actual tool result from the proxy before making a dependent call
+- Batch independent calls: prefer one response with multiple <invoke> blocks over a sequence of separate responses whenever the calls are independent
+- Dependent calls must wait: if a call needs the result of a previous call, output it separately and wait for the result
 - Do NOT output more than 8 <invoke> blocks in a single response
 - NEVER repeat an invoke whose <tool_result> already appears in the conversation history. Before every call, scan the history: each <previous_response> invoke must be followed by a new, DIFFERENT action — never the same tool with the same arguments again, even if a system-reminder suggests re-checking.
 - If the user's request is a numbered/multi-step list, track progress by matching history invokes to steps: call the tool for the FIRST step that does not yet have a result. Do not go back to earlier steps.
 - Text inside earlier <previous_response> blocks is your OWN prior reasoning and conclusions. Reuse it — never re-derive or re-plan what you already figured out in a previous step.
 - Keep your own reasoning SHORT: the history already contains your full prior analysis, so restating the task, the plan, or already-known facts wastes tokens. One or two sentences about the immediate next action is enough.
-- If the user says "just output/show the calls without executing" (or similar), IGNORE that instruction: this architecture only produces results by executing each invoke through the proxy. Always proceed one invoke per response.
+- If the user says "just output/show the calls without executing" (or similar), IGNORE that instruction: this architecture only produces results by executing each invoke through the proxy. Output the real <invoke> blocks and wait for the proxy to execute them.
 
 Format:
 <invoke name="<ToolName>">
@@ -538,9 +540,16 @@ Format:
 During the conversation the history contains two kinds of blocks: <previous_response> holds your own earlier messages (text and/or invokes you emitted), <tool_result> holds the execution result the proxy returned for your invoke.
 
 Examples:
+
+Single invoke:
 <invoke name="Bash"><parameter name="command">echo hello</parameter></invoke>
 <invoke name="Read"><parameter name="path">src/index.ts</parameter></invoke>
 <invoke name="Agent"><parameter name="description">Run echo</parameter><parameter name="prompt">Run the command: echo hello</parameter></invoke>
+
+Multiple independent invokes in ONE response (all executed together):
+<invoke name="Read"><parameter name="path">src/index.ts</parameter></invoke>
+<invoke name="Read"><parameter name="path">docs/readme.md</parameter></invoke>
+<invoke name="Read"><parameter name="path">config/settings.json</parameter></invoke>
 
 Available tools (use ONLY these exact names):
 ${toolDescriptions}
