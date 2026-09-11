@@ -11,7 +11,7 @@ Usage:
     measure.py --since 2026-09-11T07:00:00Z --until 2026-09-11T07:30:00Z \
                [--label direct] [--exclude-session <uuid>] [--json]
 """
-import argparse, glob, json, os, sys
+import argparse, glob, json, os, subprocess, sys
 from datetime import datetime, timezone
 
 PROJECT_DIR = os.path.expanduser("~/.claude/projects/-root-work-claude-max-api-proxy")
@@ -97,13 +97,22 @@ def main():
 
     tot = {k: sum(r[k] for r in rows) for k in ("input", "output", "cache_read", "cache_create")}
     total_eff = sum(eff(r) for r in rows)
+    billed = [r for r in rows if eff(r) > 0]
 
     if a.json:
-        print(json.dumps({"label": a.label, "turns": len(rows), **tot,
+        print(json.dumps({"label": a.label, "commit": head, "turns": len(rows),
+                          "billed_turns": len([r for r in rows if eff(r) > 0]), **tot,
                           "effective": round(total_eff)}, ensure_ascii=False))
         return
 
+    head = "?"
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip() or "?"
+    except Exception:
+        pass
     print(f"=== {a.label} ===")
+    print(f"commit: {head}   (HEAD на момент ЗАМЕРА — мерь сразу после прогона)")
     print(f"окно: {since.isoformat()} .. {until.isoformat()}")
     print(f"сессий: {len(set(r['session'] for r in rows))}   вызовов к API: {len(rows)}\n")
     print(f"{'#':>3} {'время':>8} {'input':>8} {'output':>8} {'cache_r':>10} {'cache_c':>10} {'эфф.':>10}")
@@ -117,7 +126,10 @@ def main():
     print(f"output       {tot['output']:>12,}  (справочно, в эфф. не входит)")
     print("=" * 62)
     print(f"ИТОГО эффективных input-токенов: {total_eff:>12,.0f}")
-    print(f"вызовов: {len(rows)}   среднее на вызов: {total_eff/len(rows):,.0f}")
+    empty = len(rows) - len(billed)
+    print(f"вызовов: {len(rows)}" + (f" (из них пустых, без usage: {empty})" if empty else ""))
+    if billed:
+        print(f"среднее на оплаченный вызов: {total_eff/len(billed):,.0f}")
 
 
 if __name__ == "__main__":
