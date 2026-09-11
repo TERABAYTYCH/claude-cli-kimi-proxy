@@ -10,7 +10,7 @@ import type {
 } from "../types/openai.js";
 import { logger } from "../utils/logger.js";
 
-export type ClaudeModel = "opus" | "sonnet" | "haiku";
+export type ClaudeModel = string;
 
 export interface CliInput {
   prompt: string;
@@ -20,18 +20,7 @@ export interface CliInput {
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
-  // Direct model names (provider prefixes like `claude-code-cli/` and `claude-max/`
-  // are stripped by extractModel before consulting this map)
-  "claude-opus-4": "opus",
-  "claude-opus-4-6": "opus",
-  "claude-sonnet-4": "sonnet",
-  "claude-sonnet-4-5": "sonnet",
-  "claude-sonnet-4-6": "sonnet",
-  "claude-sonnet-5": "sonnet",
-  "claude-opus-5": "opus",
-  "claude-haiku-4": "haiku",
-  "claude-haiku-4-5": "haiku",
-  // Bare aliases
+  // Bare aliases supported by Claude CLI --model
   "opus": "opus",
   "sonnet": "sonnet",
   "haiku": "haiku",
@@ -39,23 +28,52 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
   "sonnet-max": "sonnet",
 };
 
+// Concrete model names that the current CLI version does not accept as full
+// names. They are mapped to the closest alias so the request still works.
+// Names not in this map are passed through verbatim.
+const LEGACY_MODEL_MAP: Record<string, ClaudeModel> = {
+  "claude-opus-4": "opus",
+  "claude-opus-4-6": "opus",
+  "claude-sonnet-4": "sonnet",
+  "claude-sonnet-4-5": "sonnet",
+  "claude-sonnet-4-6": "sonnet",
+  "claude-haiku-4": "haiku",
+};
+
 /**
- * Extract Claude model alias from request model string
+ * Extract the Claude model name to pass to the CLI --model flag.
+ *
+ * The CLI accepts both aliases ("opus", "sonnet", "haiku") and full model
+ * names ("claude-opus-5", "claude-sonnet-5", etc.). We pass the requested
+ * name through verbatim after stripping provider prefixes; only bare aliases,
+ * known legacy names the CLI rejects, and empty/fallback cases are mapped.
+ *
+ * If the CLI does not recognize the model, it signals via stderr:
+ *   [claude-code:unrecognized_model] {"model":"<name>","query_source":"sdk"}
+ * and the stream-json result event carries:
+ *   { "error": "model_not_found", "is_error": true, "terminal_reason": "api_error", "api_error_status": 404 }
  */
 export function extractModel(model: string): ClaudeModel {
-  // Try direct lookup
-  if (MODEL_MAP[model]) {
-    return MODEL_MAP[model];
+  // Empty/missing model falls back to the Max subscription default.
+  if (!model) {
+    return "opus";
   }
 
-  // Try stripping provider prefix
+  // Strip provider prefixes that some OpenAI-compatible clients prepend.
   const stripped = model.replace(/^(?:claude-code-cli|claude-max)\//, "");
+
+  // Bare aliases (e.g. "opus", "sonnet") are mapped to the CLI alias.
   if (MODEL_MAP[stripped]) {
     return MODEL_MAP[stripped];
   }
 
-  // Default to opus (Claude Max subscription)
-  return "opus";
+  // Known legacy names that the CLI rejects as full names fall back to alias.
+  if (LEGACY_MODEL_MAP[stripped]) {
+    return LEGACY_MODEL_MAP[stripped];
+  }
+
+  // Pass exact model names through so the client gets the version it asked for.
+  return stripped;
 }
 
 /**

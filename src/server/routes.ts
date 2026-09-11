@@ -265,7 +265,8 @@ export async function handleChatCompletions(
     logger.info("[ChatCompletions] Request prepared", {
       requestId,
       stream,
-      model: body.model,
+      requestedModel: body.model,
+      cliModel: cliInput.model,
       resume,
       sessionKey,
       hasSessionKey: !!sessionKey,
