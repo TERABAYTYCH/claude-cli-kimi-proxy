@@ -54,8 +54,21 @@ launchctl list com.openclaw.claude-max-proxy
 
 - `src/types/claude-cli.ts` - Claude CLI JSON streaming types and type guards
 - `src/types/openai.ts` - OpenAI-compatible API types
-- `src/adapter/openai-to-cli.ts` - Converts OpenAI requests to CLI input
-- `src/adapter/cli-to-openai.ts` - Converts CLI output to OpenAI responses
+- `src/adapter/openai-to-cli.ts` - OpenAI request -> CLI input; builds the
+  system prompt, the delegation contract and the tool map
+- `src/adapter/cli-to-openai.ts` - CLI output -> OpenAI responses, usage accounting
+- `src/adapter/delegate-parser.ts` - Parses `<invoke>` blocks back into tool calls
 - `src/subprocess/manager.ts` - Spawns and manages Claude CLI subprocesses
-- `src/server/routes.ts` - Express route handlers (streaming + non-streaming)
-- `src/server/standalone.js` - Server entry point
+- `src/subprocess/session-store.ts` - Conversation key -> CLI session, per-key
+  lock, persistence across restarts
+- `src/session/resume-delta-guard.ts` - Structural checks on a resumed delta
+- `src/session/manager.ts` - Legacy session mapping, not used by the proxy path
+- `src/server/index.ts` - Express app, middleware, logging
+- `src/server/routes.ts` - Route handlers (streaming + non-streaming)
+- `src/server/standalone.ts` - Server entry point
+- `src/utils/logger.ts` - Writes every line to stdout **and** to `logs/app.log`;
+  do not redirect stdout into that same file or every line lands twice
+
+See `ARCHITECTURE.md` for how a request travels through these, the cost model,
+and decisions that should not be re-opened. `tests/benchmark/` measures proxied
+work against working with Claude Code directly.

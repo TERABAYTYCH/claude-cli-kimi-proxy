@@ -37,13 +37,23 @@ This fork in the road determines the cost of everything downstream.
    this way) and runs with `--no-session-persistence`.
 
 2. **Per-key lock** — `acquireSessionWait(key, 8000)`, polling every 100 ms.
-   Waiting rather than failing fast matters: the proxy closes the SSE stream
-   the moment it sees `</invoke>`, the client executes the tool and sends the
-   next turn roughly 15 ms later, while the lock is still held for another
-   ~500 ms until the subprocess exits and flushes its transcript. Falling back
-   immediately would turn every other turn into a full-history replay *and*
-   desynchronise the session, because the fallback process emits invokes the
-   resumed session never saw.
+
+   The lock does not decide *which* session to write to; that is never
+   ambiguous, since a conversation key maps to exactly one session id. It
+   decides *when* writing may start. The CLI keeps the conversation in
+   `~/.claude/projects/<slug>/<uuid>.jsonl`, and `--resume` means read that
+   file, replay it, append this turn. Two such processes on one file interleave
+   their appends and corrupt the transcript beyond repair.
+
+   Turns overlap because the HTTP response ends before the subprocess does: the
+   proxy returns the tool calls, the caller executes them and sends the next
+   turn while the previous subprocess is still winding down and flushing its
+   transcript. Waiting costs a fraction of a second; the old behaviour of
+   falling back immediately cost a full-history replay every other turn
+   (measured: 94 335 tokens across four such turns) and, worse, desynchronised
+   the session — the fallback process emits invocations in a throwaway session
+   that the resumed one never sees, so its memory and the caller's history
+   drift apart with nothing to detect it.
 
 3. **Session lookup happens after the lock**, never before — the previous turn
    may have persisted a newer `messageCount` while this request was waiting.
@@ -170,6 +180,14 @@ claude --print --output-format stream-json --verbose --include-partial-messages 
                                      # or --no-session-persistence with no key
 ```
 
+`--model` carries the caller's requested name verbatim once provider prefixes
+are stripped, because the CLI accepts a model's full name and not only an
+alias. Collapsing everything to `opus`/`sonnet`/`haiku`, as an earlier version
+did, silently served whatever that alias pointed at — a client asking for
+`claude-opus-5` was answered by `claude-opus-4-8` for a whole day before the
+transcripts gave it away. Only bare aliases, a short list of legacy names the
+current CLI rejects as full names, and the empty case are still mapped.
+
 The prompt goes over **stdin**, not as an argument — large bodies would hit
 `E2BIG`. The system prompt goes through a temp file for the same reason; it is
 removed when the subprocess closes. `--tools ""` disables the CLI's built-in
@@ -179,9 +197,12 @@ the CLI does not think it is nested inside another Claude Code.
 
 ### 7. Response path — `src/adapter/delegate-parser.ts`
 
-The proxy accumulates streamed text and counts `</invoke>` occurrences,
-parsing only when the count grows — scanning on every delta re-parsed the
-whole buffer and logged one quoted invoke 120 times.
+The proxy accumulates streamed text and parses delegations when the model
+finishes, on the `result` event. It also counts `</invoke>` occurrences and
+cuts early if the count reaches the batch limit of 8, as a guard against a
+response that never ends. Counting rather than re-parsing on every delta
+matters: the naive version re-scanned the whole buffer per chunk and logged a
+single quoted invoke 120 times.
 
 `parseDelegations` then:
 
@@ -217,6 +238,16 @@ history — the conversation grew unchecked.
 `setSession` runs as soon as the invoke is emitted, but the **lock is released
 only when the subprocess closes**, after the transcript is flushed; otherwise
 the next turn can `--resume` a half-written file.
+
+A resumed delta is checked for structural damage before the subprocess starts
+(`src/session/resume-delta-guard.ts`). A correct delta carries only new user
+and tool messages, so a `<previous_response>` block in it means assistant
+history is being replayed, and the caller's identity appearing at the head of
+the prompt means it has leaked out of `--system-prompt-file` into the body.
+Both are logged, neither changes handling. A size threshold guards the same
+failure more crudely; it sits at 60 000 characters, above a legitimate batch of
+file reads. An earlier 20 000-character version fired on normal batched work
+and had to be replaced, since a warning that cries wolf is read by nobody.
 
 The map is persisted atomically (temp file plus `rename`) next to `cwd`, not
 in `$HOME` — the CLI scopes transcripts by project directory, so a shared file
