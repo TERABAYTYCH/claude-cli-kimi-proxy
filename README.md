@@ -1,4 +1,21 @@
 > **Fork by [TERABAYTYCH](https://github.com/TERABAYTYCH)** — reworked to power **Kimi Code CLI, specifically the Kimi web client**, behind an OpenAI-compatible endpoint. On top of the original proxy this fork adds: delegation of all tool calls to the Kimi client via structured `<invoke>` blocks (Claude plans, Kimi executes), thinking passthrough as `reasoning_content`, Claude rate-limit errors surfaced as visible chat messages instead of blind retries, and hardened delegation parsing (no more repeated tool-call loops).
+>
+> **How delegate mode works.** When a request carries `tools`, the proxy replaces
+> Claude Code's system prompt with the caller's identity plus a delegation
+> contract and a compact tool map built from the request's own JSON schemas, and
+> starts the CLI with `--tools ""`. Claude therefore cannot execute anything; it
+> emits a single `<invoke>` block, which the proxy parses back into OpenAI
+> `tool_calls` for the client to run. Conversation state lives in a resumed
+> Claude CLI session, so each turn ships only the new `<tool_result>` or user
+> message — typically 25–150 characters — instead of replaying the whole
+> history. Session mappings survive proxy restarts, concurrent turns of one
+> conversation are serialised per key, and `prompt_tokens` reports cached input
+> so the client can manage its own context window.
+>
+> See [ARCHITECTURE.md](ARCHITECTURE.md) for the full request pipeline, the cost
+> model, and the design decisions that should not be re-opened.
+> [`tests/benchmark/`](tests/benchmark/README.md) measures proxied work against
+> working with Claude Code directly.
 
 # Claude Max API Proxy
 
