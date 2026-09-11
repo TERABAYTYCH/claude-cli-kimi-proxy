@@ -5,6 +5,10 @@
  * message history on every request.
  */
 
+import fs from "fs";
+import path from "path";
+import { logger } from "../utils/logger.js";
+
 interface SessionEntry {
   claudeSessionId: string;
   messageCount: number;
@@ -139,6 +143,28 @@ export function releaseSession(key: string): void {
   inflight.delete(key);
 }
 
+/**
+ * Like acquireSession, but waits for the key to be freed first. Needed
+ * because the next turn of the same conversation legitimately arrives while
+ * the lock is still held: the proxy closes the SSE stream on </invoke>
+ * (~15ms later Kimi executes the tool and sends the next turn) while the
+ * lock is only released on subprocess "close" (~0.5s later, after the
+ * transcript flush). An instant fallback there turns every other turn into
+ * a full-history replay AND desyncs the resumed session — the fallback
+ * process generates invokes the resumed session never saw.
+ */
+export async function acquireSessionWait(
+  key: string,
+  timeoutMs: number
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (acquireSession(key)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
 function pruneExpired(): void {
   const now = Date.now();
   for (const [key, entry] of sessions) {
@@ -177,6 +203,7 @@ export function setSession(
   messageCount: number
 ): void {
   sessions.set(key, { claudeSessionId, messageCount, lastUsed: Date.now() });
+  persistSessions();
 }
 
 /**
@@ -201,6 +228,7 @@ export function addUsage(
 
 export function clearSession(key: string): void {
   sessions.delete(key);
+  persistSessions();
   // Usage totals are per CLI session — reset them with the session, otherwise
   // the cumulative counters in the log mix several sessions of one chat.
   usageTotals.delete(key);
